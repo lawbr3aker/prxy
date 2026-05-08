@@ -1,0 +1,72 @@
+name: meek-server via ngrok
+
+on:
+  workflow_dispatch:          # trigger manually
+  schedule:
+    - cron: '*/50 * * * *'   # restart before 6h GHA limit (optional)
+
+jobs:
+  run-meek-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ── 1. Install Go ──────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # ── 2. Install meek-server ─────────────────────────────────────
+      - name: Install meek-server
+        run: |
+          go install gitlab.com/yawning/meek/meek-server@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      # ── 3. Generate a self-signed TLS cert (meek-server needs TLS) ─
+      - name: Generate TLS certificate
+        run: |
+          openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+            -days 1 -nodes \
+            -subj "/CN=${{ secrets.NGROK_DOMAIN }}"
+
+      # ── 4. Install & authenticate ngrok ───────────────────────────
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update && sudo apt-get install -y ngrok
+
+      - name: Authenticate ngrok
+        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+
+      # ── 5. Start meek-server on port 8443 ─────────────────────────
+      - name: Start meek-server
+        run: |
+          meek-server \
+            --addr 0.0.0.0:8443 \
+            --cert cert.pem \
+            --key key.pem \
+            --log meek-server.log &
+          echo "meek-server PID: $!"
+          sleep 3
+          echo "=== meek-server started ==="
+
+      # ── 6. Start ngrok tunnel pointing at meek-server ─────────────
+      - name: Start ngrok tunnel
+        run: |
+          ngrok http https://localhost:8443 \
+            --domain=${{ secrets.NGROK_DOMAIN }} \
+            --log=stdout \
+            --log-format=json &
+          sleep 5
+          echo "=== ngrok tunnel up ==="
+          echo "Public URL: https://${{ secrets.NGROK_DOMAIN }}"
+
+      # ── 7. Keep alive & tail logs ─────────────────────────────────
+      - name: Keep alive (tail logs)
+        run: |
+          echo "Meek-server running at: https://${{ secrets.NGROK_DOMAIN }}"
+          tail -f meek-server.log
