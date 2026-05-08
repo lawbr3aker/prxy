@@ -13,7 +13,7 @@ from core.server import Dispatcher
 
 
 class GASRelay(RelayBase):
-    GAS_URL = 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec'
+    GAS_URL = 'https://script.google.com/macros/s/AKfycbyNiZLWWac3GaXRJVTInzZ6tQQXfB8bD3YwGLvCt4HW9xTuK1mugOLo0X9KvpT44BeK/exec'
 
     def __init__(self, handler):
         self._handler    = handler
