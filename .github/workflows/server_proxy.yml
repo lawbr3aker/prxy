@@ -1,0 +1,78 @@
+name: Server Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout:
+        description: 'How long to keep alive (minutes)'
+        required: false
+        default: '30'
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install aiohttp
+
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -qq
+          sudo apt-get install -y ngrok
+
+      - name: Authenticate ngrok
+        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+
+      - name: Start server proxy
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+        run: python server_main.py &
+
+      - name: Wait for server to be ready
+        run: sleep 3
+
+      - name: Start ngrok tunnel
+        run: nohup ngrok http 8888 --log=stdout --log-format=json > /tmp/ngrok.log 2>&1 &
+
+      - name: Wait for ngrok and extract URL
+        run: |
+          for i in $(seq 1 20); do
+            sleep 2
+            URL=$(curl -s http://127.0.0.1:4040/api/tunnels | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["tunnels"][0]["public_url"])' 2>/dev/null || true)
+            if [ -n "$URL" ]; then
+              echo "NGROK_URL=$URL" >> $GITHUB_ENV
+              break
+            fi
+          done
+
+      - name: Show tunnel URL
+        run: |
+          echo ""
+          echo "=================================="
+          echo "  Server Proxy is live"
+          echo "  URL: $NGROK_URL"
+          echo "=================================="
+          echo ""
+          echo "### Proxy URL" >> $GITHUB_STEP_SUMMARY
+          echo "$NGROK_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Keep alive
+        run: |
+          MINUTES="${{ github.event.inputs.timeout }}"
+          MINUTES="${MINUTES:-30}"
+          echo "Keeping alive for $MINUTES minute(s)..."
+          sleep $(( MINUTES * 60 ))
