@@ -122,12 +122,16 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         while True:
             # ── Read from the browser ─────────────────────────────────────────
             data = None
+            import socket
             try:
                 data = self.connection.recv(4096)
                 logger.debug(
                     f"_handle_stream: recv pid={pid} path={self.path} "
                     f"bytes={len(data)} hash={hash(data)}"
                 )
+            except (socket.timeout, TimeoutError) as exc:
+                # No data yet — fall through to poll for a server response
+                pass
             except ConnectionResetError as exc:
                 logger.info(
                     f"_handle_stream: client reset pid={pid} path={self.path} — {exc}"
@@ -143,9 +147,6 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 if pid is not None:
                     await self._send_close_packet(pid)
                 return
-            except TimeoutError:
-                # No data yet — fall through to poll for a server response
-                pass
 
             if data is not None:
                 if not data:
@@ -195,7 +196,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 f"bytes={len(body)} hash={hash(body)}"
             )
 
-            if not body:
+            if body == b'EOF':
                 # Empty body is the server's close signal
                 logger.info(
                     f"_handle_stream: server EOF pid={pid} path={self.path}"
@@ -225,7 +226,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         logger.info(f"_handle_stream: sending close packet pid={pid}")
         packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
         packet.pid = pid
-        packet.set('b', b'')
+        packet.set('b', b'EOF')
         await self.server.handler.handle(packet)
 
     # ── Plain HTTP ────────────────────────────────────────────────────────────

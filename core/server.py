@@ -264,7 +264,7 @@ class Dispatcher:
             state = self._streams.get(pid)
 
         # ── Close signal from client ──────────────────────────────────────────
-        if not body:
+        if body == b'EOF':
             if state is not None:
                 logger.info(
                     f"Dispatcher._do_stream: client close signal pid={pid} — closing TCP"
@@ -277,10 +277,7 @@ class Dispatcher:
                 async with self._stream_lock:
                     self._streams.pop(pid, None)
             # Echo close back to client
-            close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-            close_pkt.pid = pid
-            close_pkt.set('b', b'')
-            return close_pkt
+            return self._send_close_packet(pid)
 
         # ── Open new TCP connection for this pid ──────────────────────────────
         if state is None:
@@ -308,18 +305,12 @@ class Dispatcher:
                 logger.warning(
                     f"Dispatcher._do_stream: TCP connect timeout pid={pid} {host}:{port}"
                 )
-                close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-                close_pkt.pid = pid
-                close_pkt.set('b', b'')
-                return close_pkt
+                return self._send_close_packet(pid)
             except (OSError, ConnectionRefusedError) as exc:
                 logger.error(
                     f"Dispatcher._do_stream: TCP connect failed pid={pid} {host}:{port} — {exc}"
                 )
-                close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-                close_pkt.pid = pid
-                close_pkt.set('b', b'')
-                return close_pkt
+                return self._send_close_packet(pid)
 
         # ── Write chunk to upstream ───────────────────────────────────────────
         writer = state['writer']
@@ -337,15 +328,12 @@ class Dispatcher:
             )
             async with self._stream_lock:
                 self._streams.pop(pid, None)
-            close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-            close_pkt.pid = pid
-            close_pkt.set('b', b'')
-            return close_pkt
+            return self._send_close_packet(pid)
 
         # ── Read response chunk ───────────────────────────────────────────────
         try:
             response_data = await asyncio.wait_for(
-                reader.read(65536),
+                reader.read(4096),
                 timeout=5.0
             )
             logger.debug(
@@ -363,10 +351,7 @@ class Dispatcher:
             )
             async with self._stream_lock:
                 self._streams.pop(pid, None)
-            close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-            close_pkt.pid = pid
-            close_pkt.set('b', b'')
-            return close_pkt
+            return self._send_close_packet(pid)
 
         if response_data is not None and len(response_data) == 0:
             # TCP EOF from upstream
@@ -375,12 +360,20 @@ class Dispatcher:
             )
             async with self._stream_lock:
                 self._streams.pop(pid, None)
-            close_pkt = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
-            close_pkt.pid = pid
-            close_pkt.set('b', b'')
-            return close_pkt
+            return self._send_close_packet(pid)
 
         response = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
         response.pid = pid
         response.set('b', response_data or b'')
         return response
+
+    # Send a zero-byte STREAM packet so the client knows to close the tunnel
+    async def _send_close_packet(self,
+            pid: int
+        ):
+        logger.info(f"_do_stream: sending close packet pid={pid}")
+        packet = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
+        packet.pid = pid
+        packet.set('b', b'EOF')
+        
+        return packet

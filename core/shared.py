@@ -120,7 +120,7 @@ class Packet:
 
 
 class PacketQueue:
-    LIMIT_TIMEOUT   = 0.5  # seconds — flush window
+    LIMIT_TIMEOUT   = 1    # seconds — flush window
     LIMIT_SIZE      = 512  # bytes   — unused for now, reserved
 
     def __init__(self):
