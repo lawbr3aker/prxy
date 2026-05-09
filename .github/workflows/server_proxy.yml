@@ -40,7 +40,7 @@ jobs:
       - name: Start server proxy
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
-        run: python server_main.py &
+        run: python server_main.py > /tmp/server.log 2>&1 &
 
       - name: Wait for server to be ready
         run: sleep 3
@@ -75,4 +75,12 @@ jobs:
           MINUTES="${{ github.event.inputs.timeout }}"
           MINUTES="${MINUTES:-30}"
           echo "Keeping alive for $MINUTES minute(s)..."
+          mkfifo /tmp/log_pipe
+    
+          echo "=== Real-time Server Logs ==="
+          tail -f /tmp/server.log &
+          TAIL_PID=$!
+          
           sleep $(( MINUTES * 60 ))
+          
+          kill $TAIL_PID 2>/dev/null

@@ -178,7 +178,9 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             # ── Poll for a server response chunk ──────────────────────────────
             if pid is None:
                 # Haven't sent the first packet yet — skip polling
-                continue
+                logger.error("_handle_stream: error")
+                await self._send_close_packet(pid)
+                return
 
             pool     = await self.server.handler.pool()
             response = await pool.wait_for(pid, timeout=1.0)
@@ -187,7 +189,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 # Timeout — keep looping; nothing to write yet
                 continue
 
-            body = response.get('b') or b''
+            body = response.get('b')
             if isinstance(body, str):
                 body = body.encode('latin-1')
 
