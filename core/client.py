@@ -33,15 +33,16 @@ class Handler:
         ):
         await self._relay.start()
 
-    # Inbound: relay puller deposits raw dicts from GAS → Packet objects
+    # Inbound: relay deposits raw dicts (responses from GAS) → Packet objects
+    # put_many sets asyncio.Events so wait_for() unblocks immediately
     async def receive(self,
             raw_packets: list[dict]
         ):
         packets = [Packet.deserialize(raw) for raw in raw_packets]
         await self._pool.put_many(packets)
-        logger.info(f"received {len(packets)} packet(s)")
+        logger.info(f"received {len(packets)} response(s)")
 
-    # Outbound: batch a request packet and send to GAS
+    # Outbound: stamp, batch, and send a request packet
     async def handle(self,
             packet: Packet
         ):
@@ -75,75 +76,86 @@ class Handler:
         asyncio.ensure_future(self._relay.send(request))
 
 
-class ProxyRequestHandler(http.server.SimpleHTTPRequestHandler):
+class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
+
+    # ── CONNECT tunnel ────────────────────────────────────────────────────────
     async def _handle_stream(self
         ):
         self.connection.settimeout(0.1)
 
-        pid = None
+        # Assign pid once for the whole tunnel session so all chunks
+        # share the same pid and can be matched on the server side
+        timestamp = int(time.time() * 1000)
+        pid       = IDGenerator.generate(timestamp)
+
+        # Acknowledge the tunnel
+        self.send_response(200, 'Connection established')
+        self.end_headers()
+
         while True:
+            data = None
             try:
                 data = self.connection.recv(4096)
-
-                packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
-                packet.set('destination', self.path)
-                packet.set('b', data)
-                packet.pid = pid
-
-                await self.server.handler.handle(packet)
             except TimeoutError:
                 pass
 
-            async def poll_for_response():
-                pool = await self.server.handler.pool()
-                while True:
-                    response = await pool.find(
-                        lambda p: p.pid == packet.pid and p.ptype & PacketType.RESPONSE
-                    )
-                    if response:
-                        return response
-                    await asyncio.sleep(0.05)
+            if data:
+                packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
+                packet.pid = pid
+                packet.set('destination', self.path)
+                packet.set('b', data)
 
-            try:
-                response = await asyncio.wait_for(
-                    poll_for_response(),
-                    timeout=1
-                )
-            except asyncio.TimeoutError:
-                pass
-            else:
-                self.connection.sendall(response.get('b'))
+                await self.server.handler.handle(packet)
 
+            # Wait for a response chunk for this pid
+            pool     = await self.server.handler.pool()
+            response = await pool.wait_for(pid, timeout=1.0)
+            if response:
+                body = response.get('b') or b''
+                if isinstance(body, str):
+                    body = body.encode('latin-1')
+                self.connection.sendall(body)
+
+    # ── Plain HTTP ────────────────────────────────────────────────────────────
     async def _handle_request(self
         ):
+        content_length = int(self.headers.get('Content-Length', 0))
+
         packet = Packet(ptype=PacketType.REQUEST)
         packet.set('d', self.path)
         packet.set('m', self.command)
-        if (l := int(self.headers.get('Content-Length', 0))) > 0:
-            packet.set('b', self.rfile.read(l))
+        packet.set('headers', dict(self.headers))
+        if content_length > 0:
+            packet.set('b', self.rfile.read(content_length))
 
         await self.server.handler.handle(packet)
 
-        async def poll_for_response():
-            pool = await self.server.handler.pool()
-            while True:
-                response = await pool.find(
-                    lambda p: p.pid == packet.pid and p.ptype & PacketType.RESPONSE
-                )
-                if response:
-                    return response
-                await asyncio.sleep(0.05)
+        pool     = await self.server.handler.pool()
+        response = await pool.wait_for(packet.pid, timeout=30.0)
 
-        try:
-            response = await asyncio.wait_for(
-                poll_for_response(),
-                timeout=20
-            )
-        except asyncio.TimeoutError:
+        if response is None:
             self.send_response(504)
-        else:
-            self.send_response(response.get('status') or 200)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
 
+        status  = response.get('status') or 200
+        headers = response.get('headers') or {}
+        body    = response.get('b') or b''
+        if isinstance(body, str):
+            body = body.encode('latin-1')
+
+        self.send_response(status)
+        skip = {'transfer-encoding', 'content-length', 'connection'}
+        for k, v in headers.items():
+            if k.lower() not in skip:
+                self.send_header(k, v)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── Thread→asyncio bridge ─────────────────────────────────────────────────
+    # http.server runs each request in a thread; bridge back to the event loop
     @staticmethod
     def _(coroutine):
         def callback(self):
@@ -158,8 +170,14 @@ class ProxyRequestHandler(http.server.SimpleHTTPRequestHandler):
     do_POST     = _(_handle_request)
     do_OPTIONS  = _(_handle_request)
     do_HEAD     = _(_handle_request)
+    do_PUT      = _(_handle_request)
+    do_DELETE   = _(_handle_request)
+    do_PATCH    = _(_handle_request)
 
     do_CONNECT  = _(_handle_stream)
+
+    def log_message(self, fmt, *args):
+        logger.debug(fmt, *args)
 
 
 class ProxyServer(http.server.ThreadingHTTPServer):
@@ -168,8 +186,11 @@ class ProxyServer(http.server.ThreadingHTTPServer):
     daemon_threads      = True
     allow_reuse_address = True
 
-    def __init__(self, relay_cls: typing.Type[RelayBase], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
+    def __init__(self,
+            relay_cls   : typing.Type[RelayBase],
+            addr        : tuple,
+            handler_cls : typing.Type[ProxyRequestHandler]
+        ):
+        super().__init__(addr, handler_cls)
         self.handler = Handler(relay_cls)
         self.loop    = asyncio.get_running_loop()

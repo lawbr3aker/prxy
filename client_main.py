@@ -4,7 +4,7 @@ import threading
 import logging
 #
 logging.basicConfig(
-  level=logging.DEBUG,
+  level=logging.INFO,
   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
   handlers=[
     logging.FileHandler('client.log'),
@@ -12,7 +12,7 @@ logging.basicConfig(
   ]
 )
 
-from core.client     import ProxyServer, ProxyRequestHandler
+from core.client      import ProxyServer, ProxyRequestHandler
 from client_relay_gas import GASRelay
 
 

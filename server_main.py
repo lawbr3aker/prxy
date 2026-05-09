@@ -19,7 +19,7 @@ async def main():
     handler = Handler(GASRelay)
     await handler.init()
 
-    print("Server running, waiting for packets via GAS...")
+    print(f"Server listening on 0.0.0.0:{GASRelay.LISTEN_PORT}")
     try:
         while True:
             await asyncio.sleep(1)

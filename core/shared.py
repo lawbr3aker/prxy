@@ -58,8 +58,8 @@ class Packet:
     @classmethod
     def deserialize(cls, raw: dict
         ) -> 'Packet':
-        packet          = cls(ptype=raw.get('ptype', PacketType.REQUEST))
-        packet.pid      = raw.get('pid')
+        packet           = cls(ptype=raw.get('ptype', PacketType.REQUEST))
+        packet.pid       = raw.get('pid')
         packet.timestamp = raw.get('timestamp')
         for k, v in raw.items():
             if k not in ('pid', 'ptype', 'timestamp'):
@@ -110,20 +110,62 @@ class PacketQueue:
 
 class PacketPool:
     def __init__(self):
-        self._lock = asyncio.Lock()
-        self._pool: list[Packet] = []
+        self._lock    = asyncio.Lock()
+        self._pool:    list[Packet]             = []
+        self._waiters: dict[int, asyncio.Event] = {}  # pid → event
 
     async def put(self,
             packet: Packet
         ):
+        event = None
         async with self._lock:
             self._pool.append(packet)
+            event = self._waiters.get(packet.pid)
+        if event:
+            event.set()
 
     async def put_many(self,
             packets: list[Packet]
         ):
+        events = []
         async with self._lock:
             self._pool.extend(packets)
+            for packet in packets:
+                event = self._waiters.get(packet.pid)
+                if event:
+                    events.append(event)
+        for event in events:
+            event.set()
+
+    # Zero-polling wait — suspends until the exact pid arrives or timeout
+    async def wait_for(self,
+            pid     : int,
+            timeout : float = 30.0
+        ) -> typing.Optional[Packet]:
+        event = asyncio.Event()
+
+        async with self._lock:
+            # already arrived before we registered
+            for packet in self._pool:
+                if packet.pid == pid:
+                    self._pool.remove(packet)
+                    return packet
+            self._waiters[pid] = event
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            async with self._lock:
+                self._waiters.pop(pid, None)
+
+        async with self._lock:
+            for packet in self._pool:
+                if packet.pid == pid:
+                    self._pool.remove(packet)
+                    return packet
+        return None
 
     async def find(self,
             condition: typing.Callable[Packet, bool]

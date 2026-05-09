@@ -74,9 +74,15 @@ class Handler:
         asyncio.ensure_future(self._relay.send(request))
 
 
-# Dispatcher: watches the pool for inbound REQUEST packets,
-# makes the real HTTP call, passes the response back to handle().
-# Mirrors what ProxyRequestHandler does on the client side.
+# Dispatcher: makes real HTTP calls on behalf of the server.
+#
+# Primary path   — relay calls dispatch(raw_dict) directly per packet,
+#                  awaits the response Packet, returns it synchronously.
+#                  No pool involved.
+#
+# Fallback path  — relay calls handler.receive() which fills the pool;
+#                  _run() drains the pool and calls handler.handle() with
+#                  each response so the relay's send() posts them back to GAS.
 class Dispatcher:
     def __init__(self, handler: Handler):
         self._handler = handler
@@ -85,8 +91,17 @@ class Dispatcher:
     async def start(self
         ):
         self._session = aiohttp.ClientSession()
+        # Fallback loop — only active when packets arrive via pool (puller path)
         asyncio.ensure_future(self._run())
 
+    # Primary path entry point — called directly by relay._on_push()
+    async def dispatch(self,
+            raw: dict
+        ) -> typing.Optional[Packet]:
+        packet = Packet.deserialize(raw)
+        return await self._do_request(packet)
+
+    # Fallback path loop — drains pool filled by handler.receive()
     async def _run(self
         ):
         while True:
@@ -97,11 +112,19 @@ class Dispatcher:
             if packet is None:
                 await asyncio.sleep(0.05)
                 continue
-            asyncio.ensure_future(self._dispatch(packet))
+            asyncio.ensure_future(self._dispatch_and_handle(packet))
 
-    async def _dispatch(self,
+    async def _dispatch_and_handle(self,
             packet: Packet
         ):
+        response = await self._do_request(packet)
+        if response:
+            await self._handler.handle(response)
+
+    # Core HTTP request — shared by both paths
+    async def _do_request(self,
+            packet: Packet
+        ) -> Packet:
         destination = packet.get('d') or packet.get('destination') or ''
         method      = (packet.get('m') or packet.get('method') or 'GET').upper()
         body        = packet.get('b') or packet.get('body')
@@ -116,7 +139,7 @@ class Dispatcher:
                     method,
                     destination,
                     data=body,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=25)
                 ) as r:
                 body_bytes = await r.read()
 
@@ -133,4 +156,4 @@ class Dispatcher:
             response.set('status', 502)
             response.set('b',      str(e).encode())
 
-        await self._handler.handle(response)
+        return response
