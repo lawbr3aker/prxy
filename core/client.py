@@ -2,6 +2,7 @@ import typing
 import asyncio
 import threading
 import time
+import socket
 
 import http.server
 
@@ -15,6 +16,7 @@ from .shared import (
     Packet,
     PacketQueue,
     PacketPool,
+    StreamRegistry,
     RelayRequest,
     RelayBase,
 )
@@ -22,10 +24,11 @@ from .shared import (
 
 class Handler:
     def __init__(self, relay_cls: typing.Type[RelayBase]):
-        self._relay = relay_cls(self)
+        self._relay    = relay_cls(self)
 
-        self._lock  = asyncio.Lock()
-        self._pool  = PacketPool()
+        self._lock     = asyncio.Lock()
+        self._pool     = PacketPool()
+        self._streams  = StreamRegistry()
 
         self._queue: typing.Optional[PacketQueue] = None
 
@@ -35,21 +38,36 @@ class Handler:
         await self._relay.start()
         logger.info("Handler.init: relay started")
 
-    # Inbound: relay deposits raw dicts (responses from GAS) → Packet objects.
-    # put_many sets asyncio.Events so wait_for() unblocks immediately.
+    # Inbound: relay deposits raw dicts → Packet objects.
+    # STREAM packets → StreamRegistry (ordered by seq).
+    # Plain packets  → PacketPool (wakes the exact waiter).
     async def receive(self,
             raw_packets: list[dict]
         ):
-        print("-12312309123912-39 recieved")
         packets = [Packet.deserialize(raw) for raw in raw_packets]
         logger.info(
-            f"Handler.receive: depositing {len(packets)} packet(s) into pool "
+            f"Handler.receive: {len(packets)} packet(s) "
             f"pids={[p.pid for p in packets]}"
         )
-        await self._pool.put_many(packets)
 
-    # Outbound: stamp, batch, and send a request packet.
-    # Returns True if this coroutine was the one to flush the queue, False otherwise.
+        plain = []
+        for packet in packets:
+            if packet.ptype & PacketType.STREAM:
+                logger.debug(
+                    f"Handler.receive: → StreamRegistry pid={packet.pid} "
+                    f"seq={packet.seq} ptype={PacketType.name(packet.ptype)}"
+                )
+                buf = await self._streams.get_or_create(packet.pid)
+                await buf.put(packet)
+            else:
+                plain.append(packet)
+
+        if plain:
+            await self._pool.put_many(plain)
+
+    # Outbound: stamp and send.
+    # STREAM packets skip the batching queue entirely — sent immediately.
+    # Plain packets wait in the PacketQueue flush window to batch relay calls.
     async def handle(self,
             packet: Packet
         ):
@@ -58,6 +76,12 @@ class Handler:
             packet.pid = IDGenerator.generate(packet.timestamp)
 
         logger.debug(f"Handler.handle: {packet!r}")
+
+        # Stream packets must not wait in the batching window — every extra
+        # millisecond here is a millisecond of tunnel latency.
+        if packet.ptype & PacketType.STREAM:
+            await self.submit([packet])
+            return
 
         async with self._lock:
             if self._queue is None:
@@ -68,13 +92,11 @@ class Handler:
         await queue.enqueue(packet)
         await queue.wait()
 
-        # Only the coroutine that still sees its own queue flushes.
-        # Others lost the race — their packets are already in the batch.
         payload = None
         async with self._lock:
             if self._queue is queue:
-                payload      = queue._queue[:]
-                self._queue  = None
+                payload     = queue._queue[:]
+                self._queue = None
                 logger.debug(
                     f"Handler.handle: flush winner — {len(payload)} packet(s) "
                     f"pids={[p.pid for p in payload]}"
@@ -91,11 +113,15 @@ class Handler:
         ) -> PacketPool:
         return self._pool
 
+    async def streams(self
+        ) -> StreamRegistry:
+        return self._streams
+
     async def submit(self,
             batch: list[Packet]
         ):
         request = RelayRequest(packets=batch, source='client')
-        logger.info(f"Handler.submit: dispatching {request!r}")
+        logger.info(f"Handler.submit: {request!r}")
         asyncio.ensure_future(self._relay.send(request))
 
 
@@ -117,53 +143,54 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        # pid is shared across all chunks so server can reassemble the stream
-        pid = None
+        # pid shared across all chunks so server can reassemble the stream.
+        # Assigned on first outbound packet.
+        pid    : typing.Optional[int]        = None
+        buf    : typing.Optional[object]     = None
+        reg    = await self.server.handler.streams()
 
         while True:
             # ── Read from the browser ─────────────────────────────────────────
             data = None
-            import socket
             try:
                 data = self.connection.recv(4096)
                 logger.debug(
                     f"_handle_stream: recv pid={pid} path={self.path} "
                     f"bytes={len(data)} hash={hash(data)}"
                 )
-            except (socket.timeout, TimeoutError) as exc:
-                # No data yet — fall through to poll for a server response
-                logger.debug(
-                    f"_handle_stream: timeout pid={pid} path={self.path} "
-                )
+            except (socket.timeout, TimeoutError):
+                # No data from browser right now — fall through to drain responses
                 pass
             except ConnectionResetError as exc:
                 logger.info(
                     f"_handle_stream: client reset pid={pid} path={self.path} — {exc}"
                 )
-                # Notify server of close if we have an established pid
                 if pid is not None:
-                    await self._send_close_packet(pid)
+                    await self._send_close(pid)
+                    await reg.remove(pid)
                 return
             except (BrokenPipeError, OSError) as exc:
                 logger.info(
                     f"_handle_stream: socket error pid={pid} path={self.path} — {exc}"
                 )
                 if pid is not None:
-                    await self._send_close_packet(pid)
+                    await self._send_close(pid)
+                    await reg.remove(pid)
                 return
 
             if data is not None:
                 if not data:
-                    # Zero-byte read — browser closed the connection cleanly
+                    # Zero-byte read — browser closed cleanly
                     logger.info(
                         f"_handle_stream: client EOF pid={pid} path={self.path}"
                     )
                     if pid is not None:
-                        await self._send_close_packet(pid)
+                        await self._send_close(pid)
+                        await reg.remove(pid)
                     return
 
                 packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
-                packet.pid = pid  # None on first chunk — IDGenerator fills it
+                packet.pid = pid   # None on first chunk — IDGenerator fills it
                 packet.set('destination', self.path)
                 packet.set('b', data)
 
@@ -175,64 +202,79 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
                 if pid is None:
                     pid = packet.pid
+                    buf = await reg.get_or_create(pid)
                     logger.info(
                         f"_handle_stream: tunnel established pid={pid} path={self.path}"
                     )
 
-            # ── Poll for a server response chunk ──────────────────────────────
-            if pid is None:
-                # Haven't sent the first packet yet — skip polling
-                logger.error("_handle_stream: error")
-                await self._send_close_packet(pid)
-                return
-
-            pool     = await self.server.handler.pool()
-            response = await pool.wait_for(pid, timeout=1.0)
-
-            if response is None:
-                # Timeout — keep looping; nothing to write yet
+            # ── Drain response chunks from the server ─────────────────────────
+            # On each iteration: drain all in-order chunks without extra waiting.
+            # If nothing is ready, buf.get() with a short timeout suspends cheaply.
+            if buf is None:
+                # pid not assigned yet — nothing to drain
                 continue
 
-            body = response.get('b')
-            if isinstance(body, str):
-                body = body.encode('latin-1')
+            # Non-blocking check first — avoids even the asyncio event overhead
+            # on the common case where data is already queued.
+            chunk = await buf.get(timeout=0.05)
+            if chunk is None:
+                continue
 
-            logger.debug(
-                f"_handle_stream: ← server pid={pid} ts={response.timestamp} "
-                f"bytes={len(body)} hash={hash(body)}"
-            )
+            while chunk is not None:
+                ptype = chunk.ptype
 
-            if body == b'EOF':
-                # Empty body is the server's close signal
-                logger.info(
-                    f"_handle_stream: server EOF pid={pid} path={self.path}"
-                )
-                return
+                if ptype & PacketType.CLOSE:
+                    logger.info(
+                        f"_handle_stream: server CLOSE pid={pid} path={self.path}"
+                    )
+                    await reg.remove(pid)
+                    return
 
-            try:
-                self.connection.sendall(body)
-                logger.debug(
-                    f"_handle_stream: sent to client pid={pid} bytes={len(body)}"
-                )
-            except ConnectionResetError as exc:
-                logger.info(
-                    f"_handle_stream: client reset on write pid={pid} — {exc}"
-                )
-                return
-            except (BrokenPipeError, OSError) as exc:
-                logger.info(
-                    f"_handle_stream: write error pid={pid} — {exc}"
-                )
-                return
+                if ptype & PacketType.EOF:
+                    logger.info(
+                        f"_handle_stream: server EOF pid={pid} path={self.path} "
+                        f"— upstream done, tunnel stays open"
+                    )
+                    # EOF means upstream finished sending; the tunnel is still
+                    # open for the client to send more.  Stop draining and loop.
+                    break
 
-    # Send a zero-byte STREAM packet so the server knows to close the tunnel
-    async def _send_close_packet(self,
+                body = chunk.get('b') or b''
+                if isinstance(body, str):
+                    body = body.encode('latin-1')
+
+                if body:
+                    logger.debug(
+                        f"_handle_stream: ← server pid={pid} seq={chunk.seq} "
+                        f"bytes={len(body)} hash={hash(body)}"
+                    )
+                    try:
+                        self.connection.sendall(body)
+                    except ConnectionResetError as exc:
+                        logger.info(
+                            f"_handle_stream: client reset on write pid={pid} — {exc}"
+                        )
+                        await self._send_close(pid)
+                        await reg.remove(pid)
+                        return
+                    except (BrokenPipeError, OSError) as exc:
+                        logger.info(
+                            f"_handle_stream: write error pid={pid} — {exc}"
+                        )
+                        await self._send_close(pid)
+                        await reg.remove(pid)
+                        return
+
+                # Try to drain the next in-order chunk immediately (non-blocking)
+                chunk = await buf.get(timeout=0.0)
+
+    async def _send_close(self,
             pid: int
         ):
-        logger.info(f"_handle_stream: sending close packet pid={pid}")
-        packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
+        logger.info(f"_handle_stream: sending CLOSE pid={pid}")
+        packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM | PacketType.CLOSE)
         packet.pid = pid
-        packet.set('b', b'EOF')
+        packet.set('b', b'')
         await self.server.handler.handle(packet)
 
     # ── Plain HTTP ────────────────────────────────────────────────────────────
@@ -264,7 +306,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if response is None:
             logger.warning(
-                f"_handle_request: timeout waiting for response pid={packet.pid} "
+                f"_handle_request: timeout pid={packet.pid} "
                 f"{self.command} {self.path}"
             )
             try:
@@ -302,7 +344,6 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
     # ── Thread→asyncio bridge ─────────────────────────────────────────────────
     # http.server runs each request in a thread; bridge back to the event loop.
-    # Exceptions are caught here so a crashed handler never kills the thread.
     @staticmethod
     def _(coroutine):
         def callback(self):
@@ -314,7 +355,8 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 future.result()
             except Exception as exc:
                 logger.error(
-                    f"ProxyRequestHandler: unhandled exception in {coroutine.__name__}: {exc}",
+                    f"ProxyRequestHandler: unhandled exception in "
+                    f"{coroutine.__name__}: {exc}",
                     exc_info=True
                 )
         return callback

@@ -1,28 +1,46 @@
 /**
- * relay_code.gs  —  Stateless GAS bridge
+ * relay_code.gs  —  Synchronous GAS bridge
  *
- * Two directions, two roles:
+ * Primary path  (SERVER_URL is set in Script Properties):
  *
- *   client  →  doPost(source='client')  →  cache under queue:'server'
- *   server  ←  doGet(role='server')     ←  long-poll, drain queue:'server'
+ *   client  POST {source:'client', packets:[...]}
+ *     → doPost() calls UrlFetchApp to SERVER_URL/push  (synchronous)
+ *     → server dispatches, returns {ok:true, responses:[...]}
+ *     → doPost returns responses inline to client
  *
- *   server  →  doPost(source='server')  →  cache under queue:'client'
- *   client  ←  doGet(role='client')     ←  long-poll, drain queue:'client'
+ *   One HTTP round trip. No cache. No polling.
  *
- * CacheService keys
- *   'queue:client'   JSON array of pids waiting for the client (responses)
- *   'queue:server'   JSON array of pids waiting for the server (requests)
- *   'pkt:<pid>'      JSON-serialised packet
- *   'log:<ts>'       Debug log entry (written by _log, read externally)
+ * Fallback path  (SERVER_URL missing or server unreachable):
+ *
+ *   doPost() caches packets under queue:server
+ *   server _puller  GET ?role=server  drains queue:server
+ *   server POSTs responses back  source:'server'
+ *   doPost() caches under queue:client
+ *   client _puller  GET ?role=client  drains queue:client
+ *
+ * Status / debug endpoints  (doGet ?action=...):
+ *   ?action=ping    → {ok:true, ts:...}  (liveness check)
+ *   ?action=status  → queue depths + pids
+ *   ?action=logs    → last N debug log lines
+ *   ?role=client    → long-poll fallback drain for client
+ *   ?role=server    → long-poll fallback drain for server
+ *
+ * Script Properties (Project Settings → Script Properties):
+ *   SERVER_URL   e.g. https://xxxx.ngrok-free.app
+ *                Leave empty to always use fallback/cache path.
  *
  * Packet shape mirrors Python Packet.serialize():
- *   { pid, ptype, timestamp, source, d, m, b, status, headers, ... }
+ *   { pid, ptype, timestamp, seq, b, d, m, status, headers, ... }
  */
 
-var CACHE_TTL     = 120;   // seconds
-var POLL_INTERVAL = 500;   // ms between cache checks inside doGet
+var props      = PropertiesService.getScriptProperties();
+var SERVER_URL = (props.getProperty('SERVER_URL') || '').trim();
+
+var CACHE_TTL     = 300;   // seconds — fallback packet TTL
+var POLL_INTERVAL = 300;   // ms between cache checks in fallback doGet
 var POLL_MAX      = 25000; // ms — stay under GAS 30s execution limit
-var DEBUG         = true;  // set false to silence packet-level logging
+var LOG_TTL       = 60;    // seconds — debug log line TTL in cache
+var LOG_MAX_LINES = 100;   // lines kept in ?action=logs
 
 var cache = CacheService.getScriptCache();
 
@@ -31,26 +49,24 @@ var cache = CacheService.getScriptCache();
 function _log(level, msg) {
   var line = new Date().toISOString() + ' [' + level + '] ' + msg;
   Logger.log(line);
-  if (DEBUG) {
-    // Persist recent log lines to cache so external tools can tail them
-    var key = 'log:' + Date.now();
-    try { cache.put(key, line, 30); } catch(e) { /* ignore */ }
-  }
+  try {
+    var key = 'log:' + Date.now() + ':' + Math.random().toString(36).slice(2, 6);
+    cache.put(key, line, LOG_TTL);
+  } catch(e) { /* cache write failed — ignore */ }
 }
 
-function _logPacket(direction, packet) {
-  if (!DEBUG) return;
+function _logPacket(label, packet) {
   var b    = packet.b;
-  var blen = (typeof b === 'string') ? b.length : 0;
+  var blen = (typeof b === 'string') ? b.length : (b ? b.length : 0);
   _log('DEBUG',
-    direction + ' packet ' +
-    'pid='       + packet.pid    + ' ' +
-    'ptype='     + packet.ptype  + ' ' +
-    'ts='        + packet.timestamp + ' ' +
-    'dst='       + (packet.d || packet.destination || '-') + ' ' +
-    'method='    + (packet.m || packet.method || '-') + ' ' +
-    'status='    + (packet.status || '-') + ' ' +
-    'body='      + blen + 'B'
+    label + ' ' +
+    'pid='    + packet.pid   + ' ' +
+    'ptype='  + packet.ptype + ' ' +
+    'seq='    + (packet.seq !== undefined ? packet.seq : '-') + ' ' +
+    'dst='    + (packet.d || packet.destination || '-') + ' ' +
+    'method=' + (packet.m || packet.method || '-') + ' ' +
+    'status=' + (packet.status || '-') + ' ' +
+    'body='   + blen + 'B'
   );
 }
 
@@ -64,23 +80,48 @@ function doPost(e) {
     var packets = body.packets || [];
 
     _log('INFO', 'doPost source=' + source + ' packets=' + packets.length);
-
-    // Packets from client go to queue:server and vice versa
-    var targetQueue = (source === 'client') ? 'server' : 'client';
-
     for (var i = 0; i < packets.length; i++) {
-      _logPacket('→ enqueue[' + targetQueue + ']', packets[i]);
-      _enqueue(packets[i], targetQueue);
+      _logPacket('→ recv', packets[i]);
     }
 
-    var elapsed = Date.now() - startMs;
-    _log('INFO',
-      'doPost done queued=' + packets.length +
-      ' queue=' + targetQueue +
-      ' elapsed=' + elapsed + 'ms'
-    );
+    // ── source=client → try to forward to server synchronously ───────────────
+    if (source === 'client') {
+      if (SERVER_URL) {
+        var result = _forwardToServer(packets);
+        if (result !== null) {
+          _log('INFO',
+            'doPost primary path ok responses=' + result.length +
+            ' elapsed=' + (Date.now() - startMs) + 'ms'
+          );
+          return _json({ ok: true, responses: result });
+        }
+        _log('WARN', 'doPost primary path failed — falling back to cache');
+      }
 
-    return _json({ ok: true, queued: packets.length, queue: targetQueue });
+      // Fallback: cache for server puller to pick up
+      for (var i = 0; i < packets.length; i++) {
+        _enqueue(packets[i], 'server');
+      }
+      _log('INFO',
+        'doPost fallback queued=' + packets.length +
+        ' elapsed=' + (Date.now() - startMs) + 'ms'
+      );
+      return _json({ ok: true, fallback: true, queued: packets.length });
+    }
+
+    // ── source=server → cache responses for client puller ────────────────────
+    if (source === 'server') {
+      for (var i = 0; i < packets.length; i++) {
+        _enqueue(packets[i], 'client');
+      }
+      _log('INFO',
+        'doPost server→client queued=' + packets.length +
+        ' elapsed=' + (Date.now() - startMs) + 'ms'
+      );
+      return _json({ ok: true, queued: packets.length });
+    }
+
+    return _json({ ok: false, error: 'unknown source: ' + source });
 
   } catch (err) {
     _log('ERROR', 'doPost exception: ' + err.toString());
@@ -91,30 +132,55 @@ function doPost(e) {
 
 // ── doGet ─────────────────────────────────────────────────────────────────────
 function doGet(e) {
-  var role  = (e.parameter && e.parameter.role) ? e.parameter.role : 'client';
-  var queue = role; // queue name matches the role that consumes it
+  var action = (e.parameter && e.parameter.action) ? e.parameter.action : '';
+  var role   = (e.parameter && e.parameter.role)   ? e.parameter.role   : '';
 
-  _log('INFO', 'doGet role=' + role + ' queue=' + queue + ' poll_max=' + POLL_MAX + 'ms');
+  // ── Status/debug endpoints ────────────────────────────────────────────────
+  if (action === 'ping') {
+    _log('INFO', 'doGet ping');
+    return _json({ ok: true, ts: Date.now(), server_url: SERVER_URL || null });
+  }
 
-  var start    = Date.now();
+  if (action === 'status') {
+    return _doStatus();
+  }
+
+  if (action === 'logs') {
+    return _doLogs();
+  }
+
+  // ── Fallback long-poll drain ───────────────────────────────────────────────
+  // role='client' → client is waiting for cached responses (source=server)
+  // role='server' → server is waiting for cached requests  (source=client)
+  if (!role) {
+    return _json({ ok: false, error: 'missing role or action parameter' });
+  }
+
+  _log('INFO', 'doGet poll role=' + role);
+
+  var start     = Date.now();
   var pollCount = 0;
 
   while (Date.now() - start < POLL_MAX) {
     pollCount++;
-    var batch = _drain(queue);
+    var batch = _drain(role);
 
     if (batch.length > 0) {
+      // Sort by seq for streams so chunks arrive in order;
+      // seq is 0 for plain packets so the sort is stable for them too
       batch.sort(function(a, b) {
+        var seqDiff = (a.seq || 0) - (b.seq || 0);
+        if (seqDiff !== 0) return seqDiff;
         return (a.pid || 0) - (b.pid || 0);
       });
 
       var elapsed = Date.now() - start;
       _log('INFO',
-        'doGet returning ' + batch.length + ' packet(s) ' +
+        'doGet poll returning ' + batch.length + ' packet(s) ' +
         'role=' + role + ' polls=' + pollCount + ' elapsed=' + elapsed + 'ms'
       );
       for (var i = 0; i < batch.length; i++) {
-        _logPacket('← drain[' + queue + ']', batch[i]);
+        _logPacket('← drain[' + role + ']', batch[i]);
       }
       return _json(batch);
     }
@@ -124,14 +190,57 @@ function doGet(e) {
 
   var elapsed = Date.now() - start;
   _log('INFO',
-    'doGet timeout — no packets role=' + role +
+    'doGet poll timeout role=' + role +
     ' polls=' + pollCount + ' elapsed=' + elapsed + 'ms'
   );
 
-  // Nothing ready — return empty so the puller reconnects immediately
+  // Return 204 equivalent — empty body, client reconnects immediately
   return ContentService
     .createTextOutput('')
     .setMimeType(ContentService.MimeType.TEXT);
+}
+
+
+// ── Primary path: synchronous forward to server via UrlFetchApp ───────────────
+function _forwardToServer(packets) {
+  try {
+    _log('INFO', '_forwardToServer: POST ' + SERVER_URL + '/push packets=' + packets.length);
+
+    var response = UrlFetchApp.fetch(SERVER_URL + '/push', {
+      method:             'post',
+      contentType:        'application/json',
+      payload:            JSON.stringify({ source: 'client', packets: packets }),
+      muteHttpExceptions: true
+    });
+
+    var code = response.getResponseCode();
+    var text = response.getContentText();
+
+    _log('INFO', '_forwardToServer: response code=' + code + ' body_len=' + text.length);
+
+    if (code !== 200) {
+      _log('WARN', '_forwardToServer: server returned ' + code + ': ' + text.slice(0, 200));
+      return null;
+    }
+
+    var body = JSON.parse(text);
+    if (!body.ok) {
+      _log('WARN', '_forwardToServer: server error: ' + (body.error || '?'));
+      return null;
+    }
+
+    var responses = body.responses || [];
+    _log('INFO', '_forwardToServer: got ' + responses.length + ' response(s) inline');
+    for (var i = 0; i < responses.length; i++) {
+      _logPacket('← server inline', responses[i]);
+    }
+
+    return responses;
+
+  } catch (err) {
+    _log('ERROR', '_forwardToServer: exception: ' + err.toString());
+    return null;
+  }
 }
 
 
@@ -147,17 +256,15 @@ function _enqueue(packet, queueName) {
   var qKey   = 'queue:' + queueName;
 
   cache.put(pktKey, JSON.stringify(packet), CACHE_TTL);
-  _log('DEBUG', '_enqueue: stored ' + pktKey + ' ttl=' + CACHE_TTL + 's');
 
-  // Read-modify-write the queue list atomically within GAS's single-thread model
   var raw  = cache.get(qKey) || '[]';
   var pids = JSON.parse(raw);
   pids.push(pid);
   cache.put(qKey, JSON.stringify(pids), CACHE_TTL);
 
   _log('DEBUG',
-    '_enqueue: queue[' + queueName + '] depth=' + pids.length +
-    ' pids=' + JSON.stringify(pids.slice(-10))  // log last 10 to avoid truncation
+    '_enqueue[' + queueName + ']: pid=' + pid +
+    ' depth=' + pids.length
   );
 }
 
@@ -165,65 +272,88 @@ function _drain(queueName) {
   var qKey = 'queue:' + queueName;
   var raw  = cache.get(qKey);
 
-  if (!raw) {
-    _log('DEBUG', '_drain[' + queueName + ']: queue empty (no cache entry)');
-    return [];
-  }
+  if (!raw) return [];
 
   var pids = JSON.parse(raw);
-  if (pids.length === 0) {
-    _log('DEBUG', '_drain[' + queueName + ']: queue empty (zero pids)');
-    return [];
-  }
+  if (pids.length === 0) return [];
 
-  // Take up to 50 pids per drain to stay within GAS URL-fetch limits
-  var batch    = pids.splice(0, 50);
+  var batch     = pids.splice(0, 50);
   var remaining = pids.length;
 
-  // Write back the remainder (or clear the key if empty)
   if (remaining > 0) {
     cache.put(qKey, JSON.stringify(pids), CACHE_TTL);
   } else {
     cache.remove(qKey);
   }
 
-  _log('DEBUG',
-    '_drain[' + queueName + ']: draining ' + batch.length +
-    ' pids remaining=' + remaining +
-    ' batch=' + JSON.stringify(batch)
-  );
-
   var keys   = batch.map(function(pid) { return 'pkt:' + pid; });
   var values = cache.getAll(keys);
 
-  var result = [];
+  var result  = [];
   var missing = [];
 
   batch.forEach(function(pid) {
-    var raw = values['pkt:' + pid];
-    if (!raw) {
+    var v = values['pkt:' + pid];
+    if (!v) {
       missing.push(pid);
-      _log('WARN', '_drain: pkt:' + pid + ' missing from cache (expired?)');
       return;
     }
-    result.push(JSON.parse(raw));
+    result.push(JSON.parse(v));
     cache.remove('pkt:' + pid);
-    _log('DEBUG', '_drain: consumed pkt:' + pid);
   });
 
   if (missing.length > 0) {
     _log('WARN',
-      '_drain[' + queueName + ']: ' + missing.length + ' packet(s) expired: ' +
-      JSON.stringify(missing)
+      '_drain[' + queueName + ']: ' + missing.length +
+      ' packet(s) expired: ' + JSON.stringify(missing)
     );
   }
 
   _log('INFO',
-    '_drain[' + queueName + ']: returned ' + result.length + ' packet(s) ' +
-    '(' + missing.length + ' expired)'
+    '_drain[' + queueName + ']: returned=' + result.length +
+    ' expired=' + missing.length
   );
 
   return result;
+}
+
+
+// ── Status endpoint ───────────────────────────────────────────────────────────
+function _doStatus() {
+  var clientRaw  = cache.get('queue:client') || '[]';
+  var serverRaw  = cache.get('queue:server') || '[]';
+  var clientPids = JSON.parse(clientRaw);
+  var serverPids = JSON.parse(serverRaw);
+
+  _log('INFO', 'doGet status client=' + clientPids.length + ' server=' + serverPids.length);
+
+  return _json({
+    ok:           true,
+    ts:           Date.now(),
+    server_url:   SERVER_URL || null,
+    queue_client: clientPids.length,
+    queue_server: serverPids.length,
+    client_pids:  clientPids,
+    server_pids:  serverPids
+  });
+}
+
+
+// ── Logs endpoint ─────────────────────────────────────────────────────────────
+function _doLogs() {
+  try {
+    // Log keys are 'log:<timestamp>:<random>' — list all and return sorted
+    // Note: CacheService has no list() API so we keep a rolling index instead.
+    // For simplicity, just return the last LOG_MAX_LINES from Logger.getLog().
+    var raw   = Logger.getLog();
+    var lines = raw ? raw.split('\n').filter(Boolean) : [];
+    var tail  = lines.slice(-LOG_MAX_LINES);
+
+    return _json({ ok: true, ts: Date.now(), lines: tail });
+
+  } catch (err) {
+    return _json({ ok: false, error: err.toString() });
+  }
 }
 
 
@@ -232,29 +362,4 @@ function _json(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
-}
-
-
-// ── Debug endpoint — doGet?action=logs ───────────────────────────────────────
-// Calling the web app with ?action=status returns queue depths for monitoring.
-// Extend doGet to route this:
-//
-//   function doGet(e) {
-//     if (e.parameter.action === 'status') return _doStatus();
-//     ...existing code...
-//   }
-//
-function _doStatus() {
-  var clientRaw  = cache.get('queue:client') || '[]';
-  var serverRaw  = cache.get('queue:server') || '[]';
-  var clientPids = JSON.parse(clientRaw);
-  var serverPids = JSON.parse(serverRaw);
-
-  return _json({
-    queue_client: clientPids.length,
-    queue_server: serverPids.length,
-    client_pids:  clientPids,
-    server_pids:  serverPids,
-    ts:           Date.now()
-  });
 }

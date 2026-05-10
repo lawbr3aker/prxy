@@ -20,15 +20,21 @@ class IDGenerator:
             cls._seed = (cls._seed + 1) & 0xFFF
             pid = cls._seed | (timestamp << 12)
         logger.debug(
-            f"IDGenerator.generate: seed={cls._seed:#05x} timestamp={timestamp} → pid={pid}"
+            f"IDGenerator.generate: seed={cls._seed:#05x} "
+            f"timestamp={timestamp} → pid={pid}"
         )
         return pid
 
 
 class PacketType:
+    # Bits carried in Packet.ptype
     REQUEST     = 1   # client → server request
     RESPONSE    = 2   # server → client response
     STREAM      = 4   # chunk belongs to a CONNECT tunnel
+
+    # Signal bits — combined with STREAM to carry lifecycle events.
+    # Kept in ptype (not a separate field) so GAS and serialisation don't
+    # need extra keys and the existing bitmask checks still work.
     CLOSE       = 8   # sender is closing the tunnel (either side)
     EOF         = 16  # upstream TCP reached EOF (server → client only)
 
@@ -47,7 +53,7 @@ class Packet:
     pid         : int
     ptype       : int
     timestamp   : int
-    seq         : int   # per-stream sequence number for ordering
+    seq         : int   # per-stream monotonic sequence number for ordering
 
     context     : typing.Dict[str, typing.Any]
 
@@ -120,9 +126,13 @@ class Packet:
         )
 
 
+# ── PacketQueue ───────────────────────────────────────────────────────────────
+# Batches outbound packets into a single relay call within LIMIT_TIMEOUT.
+# STREAM packets bypass this entirely — they are sent immediately to avoid
+# adding 500 ms latency to every tunnel chunk.
 class PacketQueue:
-    LIMIT_TIMEOUT   = 0.5  # seconds — flush window
-    LIMIT_SIZE      = 512  # bytes   — reserved
+    LIMIT_TIMEOUT   = 0.05  # seconds — short window; reduces relay round trips
+                             # without adding noticeable latency to streams
 
     def __init__(self):
         self._lock      = asyncio.Lock()
@@ -166,7 +176,8 @@ class PacketQueue:
 
 
 # ── PacketPool ────────────────────────────────────────────────────────────────
-# Plain REQUEST/RESPONSE: one waiter per pid, consumed once.
+# Plain REQUEST/RESPONSE: one waiter per pid, consumed exactly once.
+# STREAM chunks are routed to StreamRegistry instead.
 class PacketPool:
     def __init__(self):
         self._lock    = asyncio.Lock()
@@ -249,13 +260,66 @@ class PacketPool:
         return None
 
 
+# ── StreamState ───────────────────────────────────────────────────────────────
+# Owns the asyncio TCP connection for one CONNECT tunnel.
+# Held in Dispatcher._streams keyed by pid.
+class StreamState:
+    class Status:
+        OPEN    = 'open'
+        CLOSING = 'closing'
+        CLOSED  = 'closed'
+
+    def __init__(self,
+            pid    : int,
+            reader : asyncio.StreamReader,
+            writer : asyncio.StreamWriter
+        ):
+        self.pid     = pid
+        self.reader  = reader
+        self.writer  = writer
+        self.status  = StreamState.Status.OPEN
+        self.pump    : typing.Optional[asyncio.Task] = None
+        # monotonic seq counter — stamped on every outgoing response chunk
+        self._seq_lock = asyncio.Lock()
+        self._seq      = 0
+
+    async def next_seq(self) -> int:
+        async with self._seq_lock:
+            s        = self._seq
+            self._seq += 1
+        return s
+
+    def is_open(self) -> bool:
+        return self.status == StreamState.Status.OPEN
+
+    async def close(self
+        ):
+        if self.status == StreamState.Status.CLOSED:
+            return
+        self.status = StreamState.Status.CLOSING
+
+        if self.pump and not self.pump.done():
+            self.pump.cancel()
+            logger.debug(f"StreamState.close: cancelled pump pid={self.pid}")
+
+        try:
+            self.writer.close()
+            await self.writer.wait_closed()
+        except OSError:
+            pass
+
+        self.status = StreamState.Status.CLOSED
+        logger.info(f"StreamState.close: closed pid={self.pid}")
+
+    def __repr__(self):
+        return f"StreamState(pid={self.pid} status={self.status})"
+
+
 # ── StreamBuffer ──────────────────────────────────────────────────────────────
 # One per CONNECT tunnel (keyed by pid in StreamRegistry).
 # Holds response chunks pushed by the relay and delivers them in seq order.
 # _handle_stream calls get() which suspends until the next in-order chunk
-# is available.  The server's continuous reader stamps each chunk with a
-# monotonically increasing seq so out-of-order delivery (e.g. GAS batching)
-# is reordered here before the client sees it.
+# is available.
 class StreamBuffer:
     def __init__(self, pid: int):
         self.pid        = pid
@@ -284,7 +348,7 @@ class StreamBuffer:
         self._event.set()
 
     # Returns the next in-order packet, waiting if it hasn't arrived yet.
-    # Returns None on timeout.  Caller checks ptype for CLOSE/EOF.
+    # Returns None on timeout or if the buffer is closed.
     async def get(self,
             timeout: float = 30.0
         ) -> typing.Optional[Packet]:
@@ -295,7 +359,8 @@ class StreamBuffer:
                     packet          = self._heap.pop(0)
                     self._next_seq += 1
                     logger.debug(
-                        f"StreamBuffer.get: pid={self.pid} delivering seq={packet.seq} "
+                        f"StreamBuffer.get: pid={self.pid} "
+                        f"delivering seq={packet.seq} "
                         f"ptype={PacketType.name(packet.ptype)}"
                     )
                     return packet
@@ -330,7 +395,7 @@ class StreamBuffer:
 
 # ── StreamRegistry ────────────────────────────────────────────────────────────
 # Shared between the relay (puts chunks) and _handle_stream (gets chunks).
-# Held on Handler so both sides see the same instance.
+# Held on the client Handler so both sides see the same instance.
 class StreamRegistry:
     def __init__(self):
         self._lock    = asyncio.Lock()

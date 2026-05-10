@@ -1,8 +1,8 @@
 import typing
 import asyncio
 import time
-
 import ssl
+
 import aiohttp
 
 import logging
@@ -15,6 +15,7 @@ from .shared import (
     Packet,
     PacketQueue,
     PacketPool,
+    StreamState,
     RelayRequest,
     RelayBase,
 )
@@ -35,7 +36,7 @@ class Handler:
         await self._relay.start()
         logger.info("Handler.init: relay started")
 
-    # Inbound: relay puller deposits raw dicts from GAS → Packet objects
+    # Inbound: relay deposits raw dicts from GAS/test → Packet objects
     async def receive(self,
             raw_packets: list[dict]
         ):
@@ -46,7 +47,8 @@ class Handler:
         )
         await self._pool.put_many(packets)
 
-    # Outbound: batch a response packet and send back to GAS
+    # Outbound: stamp and send.
+    # STREAM packets skip the batching queue — sent immediately.
     async def handle(self,
             packet: Packet
         ):
@@ -55,6 +57,10 @@ class Handler:
             packet.pid = IDGenerator.generate(packet.timestamp)
 
         logger.debug(f"Handler.handle: {packet!r}")
+
+        if packet.ptype & PacketType.STREAM:
+            await self.submit([packet])
+            return
 
         async with self._lock:
             if self._queue is None:
@@ -65,8 +71,6 @@ class Handler:
         await queue.enqueue(packet)
         await queue.wait()
 
-        # BUG FIX: original code used `batch` without checking if we're the flush winner,
-        # meaning every coroutine would call submit() even though only one owns the payload.
         batch = None
         async with self._lock:
             if self._queue is queue:
@@ -92,51 +96,74 @@ class Handler:
             batch: list[Packet]
         ):
         request = RelayRequest(packets=batch, source='server')
-        logger.info(f"Handler.submit: dispatching {request!r}")
+        logger.info(f"Handler.submit: {request!r}")
         asyncio.ensure_future(self._relay.send(request))
 
 
-# Dispatcher: makes real HTTP/TCP calls on behalf of the client.
-#
-# Primary path  — relay calls dispatch(raw_dict) directly per packet,
-#                 awaits the response Packet, and returns it inline so
-#                 GAS can forward it back to the client in the same round trip.
-#
-# Fallback path — relay calls handler.receive() which fills the pool;
-#                 _run() drains the pool and calls handler.handle() with
-#                 each response so send() posts them back to GAS cache.
-#
-# STREAM packets — each chunk shares a pid; an open aiohttp connection is
-#                  kept alive in _stream_sessions keyed by pid until either
-#                  side sends a zero-byte close signal.
 class Dispatcher:
+    """
+    Makes real HTTP/TCP calls on behalf of the client.
+
+    Primary path — relay calls dispatch(raw) directly; plain HTTP returns a
+    Packet inline; STREAM chunks return None (pump pushes responses back).
+
+    Fallback path — relay calls handler.receive() which fills the pool;
+    _run() drains and dispatches.
+
+    STREAM lifecycle
+    ────────────────
+    First DATA chunk for a pid:
+      • Opens TCP connection → creates StreamState.
+      • Starts _stream_pump task.
+      • Writes data chunk.
+      • Returns None.
+
+    Subsequent DATA chunks:
+      • Writes to existing StreamState.writer.
+      • Returns None.
+
+    CLOSE chunk from client:
+      • Closes StreamState (cancels pump, closes writer).
+      • Sends CLOSE response back to client.
+      • Returns None.
+
+    _stream_pump:
+      • Reads from StreamState.reader in a tight loop.
+      • Stamps each chunk with a monotonically increasing seq.
+      • Calls handler.handle() → relay.send() → client StreamRegistry.
+      • On EOF or error, sends EOF/CLOSE and exits.
+    """
+
     def __init__(self, handler: Handler):
-        self._handler = handler
-        self._session : typing.Optional[aiohttp.ClientSession]                         = None
-        # pid → open streaming connection state
-        # { 'writer': asyncio.StreamWriter, 'reader': asyncio.StreamReader }
-        self._streams : dict[int, dict]                                                = {}
+        self._handler     = handler
+        self._session     : typing.Optional[aiohttp.ClientSession] = None
+        self._streams     : dict[int, StreamState]                 = {}
         self._stream_lock = asyncio.Lock()
 
     async def start(self
         ):
-        import certifi
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context))
+        ssl_context                  = ssl.create_default_context()
+        ssl_context.check_hostname   = False
+        ssl_context.verify_mode      = ssl.CERT_NONE
+        self._session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_context)
+        )
         logger.info("Dispatcher.start: aiohttp session created")
-        # Fallback loop — only active when packets arrive via pool (puller path)
         asyncio.ensure_future(self._run())
         logger.info("Dispatcher.start: fallback _run() loop started")
 
     async def stop(self
         ):
+        async with self._stream_lock:
+            states = list(self._streams.values())
+            self._streams.clear()
+        for state in states:
+            await state.close()
         if self._session:
             await self._session.close()
-            logger.info("Dispatcher.stop: aiohttp session closed")
+        logger.info("Dispatcher.stop: all streams closed, session closed")
 
-    # Primary path entry point — called directly by relay._on_push()
+    # Primary path
     async def dispatch(self,
             raw: dict
         ) -> typing.Optional[Packet]:
@@ -144,10 +171,12 @@ class Dispatcher:
         logger.debug(f"Dispatcher.dispatch: {packet!r}")
 
         if packet.ptype & PacketType.STREAM:
-            return await self._do_stream(packet)
+            await self._do_stream(packet)
+            return None
+
         return await self._do_request(packet)
 
-    # Fallback path loop — drains pool filled by handler.receive()
+    # Fallback path
     async def _run(self
         ):
         logger.debug("Dispatcher._run: fallback loop started")
@@ -157,25 +186,22 @@ class Dispatcher:
                 lambda p: bool(p.ptype & PacketType.REQUEST)
             )
             if packet is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
                 continue
             logger.debug(f"Dispatcher._run: fallback dispatching {packet!r}")
-            asyncio.ensure_future(self._dispatch_and_handle(packet))
+            asyncio.ensure_future(self._fallback_dispatch(packet))
 
-    async def _dispatch_and_handle(self,
+    async def _fallback_dispatch(self,
             packet: Packet
         ):
         if packet.ptype & PacketType.STREAM:
-            response = await self._do_stream(packet)
+            await self._do_stream(packet)
         else:
             response = await self._do_request(packet)
-        if response:
-            logger.debug(
-                f"Dispatcher._dispatch_and_handle: handling response {response!r}"
-            )
-            await self._handler.handle(response)
+            if response:
+                await self._handler.handle(response)
 
-    # ── Plain HTTP request ────────────────────────────────────────────────────
+    # ── Plain HTTP ────────────────────────────────────────────────────────────
     async def _do_request(self,
             packet: Packet
         ) -> typing.Optional[Packet]:
@@ -201,7 +227,8 @@ class Dispatcher:
                     destination,
                     data=body,
                     headers={k: v for k, v in headers.items()
-                             if k.lower() not in {'host', 'content-length', 'transfer-encoding'}},
+                             if k.lower() not in
+                             {'host', 'content-length', 'transfer-encoding'}},
                     timeout=aiohttp.ClientTimeout(total=25),
                     allow_redirects=True
                 ) as r:
@@ -220,7 +247,8 @@ class Dispatcher:
 
         except asyncio.TimeoutError:
             logger.warning(
-                f"Dispatcher._do_request: timeout pid={packet.pid} {method} {destination}"
+                f"Dispatcher._do_request: timeout pid={packet.pid} "
+                f"{method} {destination}"
             )
             response = Packet(ptype=PacketType.RESPONSE)
             response.pid = packet.pid
@@ -249,25 +277,34 @@ class Dispatcher:
 
         return response
 
-    # ── STREAM (CONNECT tunnel) chunk ─────────────────────────────────────────
-    # Each chunk for a given pid is routed through the same TCP connection.
-    # A zero-byte chunk signals close from either side.
+    # ── STREAM chunk handler ──────────────────────────────────────────────────
     async def _do_stream(self,
             packet: Packet
-        ) -> typing.Optional[Packet]:
-        pid  = packet.pid
-        body = packet.get('b') or b''
+        ):
+        pid   = packet.pid
+        ptype = packet.ptype
+        body  = packet.get('b') or b''
         if isinstance(body, str):
             body = body.encode('latin-1')
 
         logger.debug(
-            f"Dispatcher._do_stream: pid={pid} bytes={len(body)} "
-            f"destination={packet.get('destination')}"
+            f"Dispatcher._do_stream: pid={pid} "
+            f"ptype={PacketType.name(ptype)} "
+            f"bytes={len(body)} "
+            f"dst={packet.get('destination')}"
         )
+
+        # ── CLOSE from client ─────────────────────────────────────────────────
+        if ptype & PacketType.CLOSE:
+            logger.info(f"Dispatcher._do_stream: CLOSE pid={pid}")
+            await self._close_stream(pid)
+            await self._send_signal(pid, PacketType.RESPONSE | PacketType.STREAM | PacketType.CLOSE)
+            return
 
         async with self._stream_lock:
             state = self._streams.get(pid)
-        # ── Open new TCP connection for this pid ──────────────────────────────
+
+        # ── First chunk — open TCP and start pump ─────────────────────────────
         if state is None:
             destination = packet.get('destination') or ''
             host, _, port_str = destination.rpartition(':')
@@ -283,108 +320,146 @@ class Dispatcher:
                     asyncio.open_connection(host, port),
                     timeout=10.0
                 )
-                state = {'reader': reader, 'writer': writer}
-                async with self._stream_lock:
-                    self._streams[pid] = state
-                logger.info(
-                    f"Dispatcher._do_stream: TCP connected pid={pid} → {host}:{port}"
-                )
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"Dispatcher._do_stream: TCP connect timeout pid={pid} {host}:{port}"
+                    f"Dispatcher._do_stream: TCP connect timeout pid={pid} "
+                    f"{host}:{port}"
                 )
-                return self._send_close_packet(pid)
+                await self._send_signal(
+                    pid,
+                    PacketType.RESPONSE | PacketType.STREAM | PacketType.CLOSE
+                )
+                return
             except (OSError, ConnectionRefusedError) as exc:
                 logger.error(
-                    f"Dispatcher._do_stream: TCP connect failed pid={pid} {host}:{port} — {exc}"
+                    f"Dispatcher._do_stream: TCP connect failed pid={pid} "
+                    f"{host}:{port} — {exc}"
                 )
-                return self._send_close_packet(pid)
-            asyncio.create_task(self._stream_pump(pid))
+                await self._send_signal(
+                    pid,
+                    PacketType.RESPONSE | PacketType.STREAM | PacketType.CLOSE
+                )
+                return
 
-        # ── Close signal from client ──────────────────────────────────────────
-        if body == b'EOF':
             logger.info(
-                f"Dispatcher._do_stream: client close signal pid={pid} — closing TCP"
+                f"Dispatcher._do_stream: TCP connected pid={pid} → {host}:{port}"
             )
+
+            state = StreamState(pid, reader, writer)
+            async with self._stream_lock:
+                self._streams[pid] = state
+
+            # Start pump before writing — upstream may send data immediately
+            # after the first write (e.g. TLS ServerHello)
+            state.pump = asyncio.ensure_future(self._stream_pump(pid))
+
+        # ── Write data to upstream ────────────────────────────────────────────
+        if body:
             try:
-                state['writer'].close()
-                await state['writer'].wait_closed()
-            except OSError:
-                pass
-            async with self._stream_lock:
-                self._streams.pop(pid, None)
-            # Echo close back to client
-            return self._send_close_packet(pid)
+                logger.debug(
+                    f"Dispatcher._do_stream: write pid={pid} bytes={len(body)}"
+                )
+                state.writer.write(body)
+                await state.writer.drain()
+            except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                logger.info(
+                    f"Dispatcher._do_stream: write error pid={pid} — {exc}"
+                )
+                await self._close_stream(pid)
+                await self._send_signal(
+                    pid,
+                    PacketType.RESPONSE | PacketType.STREAM | PacketType.CLOSE
+                )
 
-        # ── Write chunk to upstream ───────────────────────────────────────────
-        writer = state['writer']
-
-        try:
-            logger.debug(
-                f"Dispatcher._do_stream: write pid={pid} bytes={len(body)}"
-            )
-            writer.write(body)
-            await writer.drain()
-        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-            logger.info(
-                f"Dispatcher._do_stream: write error pid={pid} — {exc}"
-            )
-            async with self._stream_lock:
-                self._streams.pop(pid, None)
-            return self._send_close_packet(pid)
-    
+    # ── Continuous upstream reader ────────────────────────────────────────────
     async def _stream_pump(self,
-            pid
+            pid: int
         ):
+        logger.info(f"Dispatcher._stream_pump: started pid={pid}")
+
         async with self._stream_lock:
             state = self._streams.get(pid)
-        reader = state['reader']
-        # ── Read response chunk ───────────────────────────────────────────────
-        while True:
-            try:
-                response_data = await asyncio.wait_for(
-                    reader.read(4096),
-                    timeout=5.0
-                )
-                logger.debug(
-                    f"Dispatcher._do_stream: read pid={pid} bytes={len(response_data)}"
-                )
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                # No data ready yet — return empty non-close chunk
-                logger.debug(
-                    f"Dispatcher._do_stream: read timeout pid={pid} — no data ready"
-                )
-                response_data = None
-            except (ConnectionResetError, OSError) as exc:
-                logger.info(
-                    f"Dispatcher._do_stream: read error pid={pid} — {exc}"
-                )
-                async with self._stream_lock:
-                    self._streams.pop(pid, None)
-                return self._send_close_packet(pid)
-            else:
-                if not response_data:
-                    logger.info(
-                        f"Dispatcher._do_stream: upstream EOF pid={pid}"
+        if state is None:
+            logger.warning(f"Dispatcher._stream_pump: no state at start pid={pid}")
+            return
+
+        reader = state.reader
+
+        try:
+            while state.is_open():
+                try:
+                    data = await asyncio.wait_for(reader.read(65536), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # No upstream data for 30 s — check connection still alive
+                    logger.debug(
+                        f"Dispatcher._stream_pump: idle 30s pid={pid} — looping"
                     )
-                    async with self._stream_lock:
-                        self._streams.pop(pid, None)
-                    return self._send_close_packet(pid)
+                    continue
+                except (ConnectionResetError, OSError) as exc:
+                    logger.info(
+                        f"Dispatcher._stream_pump: read error pid={pid} — {exc}"
+                    )
+                    await self._close_stream(pid)
+                    await self._send_signal(
+                        pid,
+                        PacketType.RESPONSE | PacketType.STREAM | PacketType.CLOSE
+                    )
+                    return
+
+                if not data:
+                    # TCP EOF — upstream finished sending
+                    logger.info(
+                        f"Dispatcher._stream_pump: upstream EOF pid={pid}"
+                    )
+                    await self._close_stream(pid)
+                    await self._send_signal(
+                        pid,
+                        PacketType.RESPONSE | PacketType.STREAM | PacketType.EOF
+                    )
+                    return
+
+                seq = await state.next_seq()
+                logger.debug(
+                    f"Dispatcher._stream_pump: read pid={pid} seq={seq} "
+                    f"bytes={len(data)}"
+                )
 
                 response = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
                 response.pid = pid
-                response.set('b', response_data)
-
+                response.seq = seq
+                response.set('b', data)
                 await self._handler.handle(response)
-            await asyncio.sleep(0.1)
 
-    # Send a zero-byte STREAM packet so the client knows to close the tunnel
-    def _send_close_packet(self,
+        except asyncio.CancelledError:
+            logger.info(f"Dispatcher._stream_pump: cancelled pid={pid}")
+            raise
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    async def _close_stream(self,
             pid: int
         ):
-        logger.info(f"_do_stream: sending close packet pid={pid}")
-        packet = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
+        async with self._stream_lock:
+            state = self._streams.pop(pid, None)
+        if state:
+            await state.close()
+
+    async def _send_signal(self,
+            pid   : int,
+            ptype : int
+        ):
+        logger.info(
+            f"Dispatcher._send_signal: pid={pid} "
+            f"ptype={PacketType.name(ptype)}"
+        )
+        packet = Packet(ptype=ptype)
         packet.pid = pid
-        packet.set('b', b'EOF')
-        
-        return packet
+
+        # Signal packets also carry a seq so StreamBuffer can order them
+        # correctly relative to data chunks already in flight.
+        async with self._stream_lock:
+            state = self._streams.get(pid)
+        if state:
+            packet.seq = await state.next_seq()
+
+        packet.set('b', b'')
+        await self._handler.handle(packet)
