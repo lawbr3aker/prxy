@@ -16,11 +16,16 @@ class Handler(HandlerBase):
     def __init__(self, relay_cls: typing.Type[RelayBase]):
         super().__init__(relay_cls, source='client')
         self._streams = StreamRegistry()
+        self._closed_pids = set()           # track closed tunnels
 
     async def _inbound(self, packets: list[Packet]):
         plain = []
         for packet in packets:
             if packet.ptype & PacketType.STREAM:
+                # Ignore stale packets for already closed streams
+                if packet.pid in self._closed_pids:
+                    self._log.debug(f"dropping stale packet for closed pid={packet.pid}")
+                    continue
                 buf = await self._streams.get_or_create(packet.pid)
                 await buf.put(packet)
             else:
@@ -29,7 +34,14 @@ class Handler(HandlerBase):
             await self._pool.put_many(plain)
 
     async def streams(self) -> StreamRegistry:
+        """Return the stream registry (used by ProxyRequestHandler)."""
         return self._streams
+
+    async def close_stream(self, pid: int):
+        """Mark a tunnel as closed and remove its buffer."""
+        self._closed_pids.add(pid)
+        await self._streams.remove(pid)
+        self._log.debug(f"closed stream pid={pid}")
 
 
 class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -49,11 +61,9 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         pid = None
         buf = None
         reg = await self.server.handler.streams()
-        # sequence number for outgoing stream chunks (optional, for ordering)
         seq_out = 0
 
         while True:
-            # Read from browser
             data = None
             try:
                 data = self.connection.recv(65536)
@@ -64,8 +74,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             except (ConnectionResetError, BrokenPipeError, OSError) as exc:
                 self._log.info(f"client reset pid={pid} — {exc}")
                 if pid is not None:
-                    await self._send_close(pid)
-                    await reg.remove(pid)
+                    await self.server.handler.close_stream(pid)
                 return
 
             if data is not None:
@@ -73,7 +82,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                     self._log.info(f"client EOF pid={pid}")
                     if pid is not None:
                         await self._send_close(pid)
-                        await reg.remove(pid)
+                        await self.server.handler.close_stream(pid)
                     return
 
                 packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
@@ -93,7 +102,6 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             if buf is None:
                 continue
 
-            # Drain response chunks (in sequence order)
             chunk = await buf.get(timeout=0.05)
             if chunk is None:
                 continue
@@ -102,10 +110,11 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 ptype = chunk.ptype
                 if ptype & PacketType.CLOSE:
                     self._log.info(f"server CLOSE pid={pid}")
-                    await reg.remove(pid)
+                    await self.server.handler.close_stream(pid)
                     return
                 if ptype & PacketType.EOF:
                     self._log.info(f"server EOF pid={pid} — tunnel open, but no more data")
+                    # Do not close the tunnel yet; client may still send data
                     break
 
                 body = chunk.get('body') or b''
@@ -118,9 +127,9 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                     except (ConnectionResetError, BrokenPipeError, OSError) as exc:
                         self._log.info(f"write error pid={pid} — {exc}")
                         await self._send_close(pid)
-                        await reg.remove(pid)
+                        await self.server.handler.close_stream(pid)
                         return
-                chunk = await buf.get(timeout=0.0)  # non‑blocking drain
+                chunk = await buf.get(timeout=0.0)
 
     async def _send_close(self, pid: int):
         self._log.info(f"sending CLOSE pid={pid}")
@@ -128,6 +137,8 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         packet.pid = pid
         packet.set('body', b'')
         await self.server.handler.handle(packet)
+        # Optionally close the stream immediately after sending CLOSE
+        await self.server.handler.close_stream(pid)
 
     async def _handle_request(self):
         self._log.info(f"{self.command} {self.path}")

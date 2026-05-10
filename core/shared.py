@@ -1,5 +1,6 @@
 import typing
 import abc
+import heapq
 import bisect
 import threading
 import time
@@ -228,20 +229,25 @@ class StreamBuffer:
     def __init__(self, pid: int):
         self.pid = pid
         self._lock = asyncio.Lock()
-        self._heap: list[Packet] = []
+        self._heap = []               # min-heap of (key, counter, packet)
+        self._counter = 0             # unique insertion order to break ties
         self._next_seq = 0
         self._event = asyncio.Event()
         self._closed = False
 
     async def put(self, packet: Packet):
-        seq = packet.seq if packet.seq is not None else 0
+        # Use seq for stream packets, otherwise timestamp
+        if packet.ptype & PacketType.STREAM:
+            key = packet.seq if packet.seq is not None else 0
+        else:
+            key = packet.timestamp if packet.timestamp is not None else 0
         async with self._lock:
             if self._closed:
-                self._log.warning(f"pid={self.pid} closed – dropping seq={seq}")
+                self._log.warning(f"pid={self.pid} closed – dropping seq={key}")
                 return
-            # Insert sorted by seq (stream chunks) or timestamp for non‑stream
-            key = seq if packet.ptype & PacketType.STREAM else (packet.timestamp or 0)
-            bisect.insort(self._heap, (key, packet))
+            # Push with unique counter to avoid comparing Packet objects
+            heapq.heappush(self._heap, (key, self._counter, packet))
+            self._counter += 1
         self._event.set()
 
     async def get(self, timeout: float = 30.0) -> typing.Optional[Packet]:
@@ -249,17 +255,17 @@ class StreamBuffer:
         if timeout == 0:
             async with self._lock:
                 if self._heap and self._heap[0][0] == self._next_seq:
-                    key, packet = self._heap.pop(0)
+                    key, _, packet = heapq.heappop(self._heap)
                     self._next_seq = key + 1
                     return packet
                 return None
 
-        # Blocking path
+        # Blocking path with timeout
         deadline = time.monotonic() + timeout
         while True:
             async with self._lock:
                 if self._heap and self._heap[0][0] == self._next_seq:
-                    key, packet = self._heap.pop(0)
+                    key, _, packet = heapq.heappop(self._heap)
                     self._next_seq = key + 1
                     return packet
                 if self._closed:
@@ -347,9 +353,9 @@ class HandlerBase(abc.ABC):
             packet.pid = IDGenerator.generate(packet.timestamp)
 
         # Stream packets bypass batching
-        if packet.ptype & PacketType.STREAM:
-            await self._submit([packet])
-            return
+        # if packet.ptype & PacketType.STREAM:
+        #     await self._submit([packet])
+        #     return
 
         async with self._lock:
             if self._queue is None:
