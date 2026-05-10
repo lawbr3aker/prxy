@@ -74,7 +74,7 @@ class ClientTestRelay(RelayBase):
 
         packets_info = [
             f"pid={p.pid} ptype={PacketType.name(p.ptype)} "
-            f"seq={p.seq} body={len(p.get('b') or b'') if p.get('b') else 0}B"
+            f"body={len(p.get('b') or b'') if p.get('b') else 0}B"
             for p in request.packets
         ]
         logger.info(
@@ -96,7 +96,6 @@ class ClientTestRelay(RelayBase):
             logger.debug(
                 f"ClientTestRelay.send: response pid={r.get('pid')} "
                 f"ptype={PacketType.name(r.get('ptype', 0))} "
-                f"seq={r.get('seq', 0)} "
                 f"body={len(r.get('b') or '') if r.get('b') else 0}B"
             )
         await self._handler.receive(responses)

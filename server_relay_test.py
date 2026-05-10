@@ -57,7 +57,6 @@ class ServerTestRelay(RelayBase):
             logger.debug(
                 f"ServerTestRelay.push: packet pid={p.get('pid')} "
                 f"ptype={PacketType.name(p.get('ptype', 0))} "
-                f"seq={p.get('seq', 0)} "
                 f"dst={p.get('d') or p.get('destination')} "
                 f"body={len(p.get('b') or '') if p.get('b') else 0}B"
             )
@@ -78,7 +77,7 @@ class ServerTestRelay(RelayBase):
         for r in valid:
             logger.debug(
                 f"ServerTestRelay.push: response pid={r.pid} "
-                f"ptype={PacketType.name(r.ptype)} seq={r.seq} "
+                f"ptype={PacketType.name(r.ptype)} "
                 f"status={r.get('status')} "
                 f"body={len(r.get('b') or b'') if r.get('b') else 0}B"
             )
@@ -106,7 +105,7 @@ class ServerTestRelay(RelayBase):
         for p in request.packets:
             logger.debug(
                 f"ServerTestRelay.send: pid={p.pid} "
-                f"ptype={PacketType.name(p.ptype)} seq={p.seq} "
+                f"ptype={PacketType.name(p.ptype)} "
                 f"body={len(p.get('b') or b'') if p.get('b') else 0}B"
             )
 
