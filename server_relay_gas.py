@@ -14,7 +14,7 @@ from core.server import Dispatcher
 
 
 class GASRelay(RelayBase):
-    GAS_URL     = 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec'
+    GAS_URL     = 'https://script.google.com/macros/s/AKfycbx2U1r5zYHhPs45LLMVb09mS-9iUbJbYg6DbXfBaC658JXO-NGKbYYMDVsiwyY4sbqJ/exec'
     LISTEN_PORT = 8888
 
     def __init__(self, handler):

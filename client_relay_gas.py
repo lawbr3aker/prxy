@@ -12,7 +12,7 @@ from core.shared import RelayBase, RelayRequest
 
 
 class GASRelay(RelayBase):
-    GAS_URL = 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec'
+    GAS_URL = 'https://script.google.com/macros/s/AKfycbx2U1r5zYHhPs45LLMVb09mS-9iUbJbYg6DbXfBaC658JXO-NGKbYYMDVsiwyY4sbqJ/exec'
 
     def __init__(self, handler):
         self._handler       = handler
