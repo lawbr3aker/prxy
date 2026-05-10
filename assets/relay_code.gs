@@ -67,8 +67,10 @@ function doGet(e) {
 
 function _forwardToServer(packets) {
   try {
-    var resp = UrlFetchApp.fetch(SERVER_URL + '/', {
-      method: 'post', contentType: 'application/json',
+    var url = SERVER_URL + '/';     // ← add trailing slash or use root
+    var resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
       payload: JSON.stringify({ source: 'client', packets: packets }),
       muteHttpExceptions: true
     });

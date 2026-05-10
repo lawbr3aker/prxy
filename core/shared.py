@@ -245,37 +245,36 @@ class StreamBuffer:
         self._event.set()
 
     async def get(self, timeout: float = 30.0) -> typing.Optional[Packet]:
-        # Non‑blocking path
-        if timeout == 0:
-            async with self._lock:
-                if self._heap and self._heap[0][0] >= self._next_seq:
-                    key, packet = self._heap.pop(0)
-                    self._next_seq = key + 1
-                    return packet
-                if self._closed:
-                    return None
-                return None
+    # Non‑blocking path
+    if timeout == 0:
+        async with self._lock:
+            if self._heap and self._heap[0][0] == self._next_seq:
+                key, packet = self._heap.pop(0)
+                self._next_seq = key + 1
+                return packet
+            return None
 
-        # Blocking path
-        deadline = time.monotonic() + timeout
-        while True:
-            async with self._lock:
-                if self._heap and self._heap[0][0] >= self._next_seq:
-                    key, packet = self._heap.pop(0)
-                    self._next_seq = key + 1
-                    return packet
-                if self._closed:
-                    return None
-                self._event.clear()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._log.warning(f"pid={self.pid} timeout after {timeout}s")
+    # Blocking path with timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        async with self._lock:
+            if self._heap and self._heap[0][0] == self._next_seq:
+                key, packet = self._heap.pop(0)
+                self._next_seq = key + 1
+                return packet
+            if self._closed:
                 return None
-            try:
-                await asyncio.wait_for(self._event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                self._log.warning(f"pid={self.pid} timeout")
-                return None
+            self._event.clear()
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._log.warning(f"pid={self.pid} timeout waiting for seq={self._next_seq}")
+            return None
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            self._log.warning(f"pid={self.pid} timeout waiting for seq={self._next_seq}")
+            return None
 
     async def close(self):
         async with self._lock:

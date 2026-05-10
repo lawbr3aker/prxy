@@ -56,7 +56,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             # Read from browser
             data = None
             try:
-                data = self.connection.recv(4096)
+                data = self.connection.recv(65536)
                 if data:
                     self._log.debug(f"recv pid={pid} bytes={len(data)}")
             except (socket.timeout, TimeoutError):
