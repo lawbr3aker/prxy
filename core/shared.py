@@ -254,7 +254,7 @@ class StreamBuffer:
                     return packet
                 return None
 
-        # Blocking path with timeout
+        # Blocking path
         deadline = time.monotonic() + timeout
         while True:
             async with self._lock:
