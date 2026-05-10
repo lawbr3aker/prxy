@@ -40,6 +40,7 @@ class Handler:
     async def receive(self,
             raw_packets: list[dict]
         ):
+        print("-12312309123912-39 recieved")
         packets = [Packet.deserialize(raw) for raw in raw_packets]
         logger.info(
             f"Handler.receive: depositing {len(packets)} packet(s) into pool "
@@ -131,6 +132,9 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 )
             except (socket.timeout, TimeoutError) as exc:
                 # No data yet — fall through to poll for a server response
+                logger.debug(
+                    f"_handle_stream: timeout pid={pid} path={self.path} "
+                )
                 pass
             except ConnectionResetError as exc:
                 logger.info(

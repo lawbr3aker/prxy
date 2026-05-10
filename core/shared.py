@@ -1,5 +1,6 @@
 import typing
 import abc
+import threading
 
 import time
 import asyncio
@@ -11,34 +12,25 @@ logger = logging.getLogger(__name__)
 
 class IDGenerator:
     _seed = 0
-    _lock = threading.Lock() if False else None  # noqa — replaced below
+    _lock = threading.Lock()
 
     @classmethod
-    def generate(cls, timestamp):
-        cls._seed = (cls._seed + 1) & 0xFFF
-        pid = cls._seed | (timestamp << 12)
-        logger.debug(f"IDGenerator.generate: seed={cls._seed:#05x} timestamp={timestamp} → pid={pid}")
+    def generate(cls, timestamp: int) -> int:
+        with cls._lock:
+            cls._seed = (cls._seed + 1) & 0xFFF
+            pid = cls._seed | (timestamp << 12)
+        logger.debug(
+            f"IDGenerator.generate: seed={cls._seed:#05x} timestamp={timestamp} → pid={pid}"
+        )
         return pid
-
-# Thread-safe seed — IDGenerator.generate() is called from HTTP threads
-import threading
-IDGenerator._lock = threading.Lock()
-_orig_generate    = IDGenerator.generate.__func__
-
-def _safe_generate(cls, timestamp):
-    with cls._lock:
-        cls._seed = (cls._seed + 1) & 0xFFF
-        pid = cls._seed | (timestamp << 12)
-    logger.debug(f"IDGenerator.generate: seed={cls._seed:#05x} timestamp={timestamp} → pid={pid}")
-    return pid
-
-IDGenerator.generate = classmethod(_safe_generate)
 
 
 class PacketType:
-    REQUEST     = 1
-    RESPONSE    = 2
-    STREAM      = 4
+    REQUEST     = 1   # client → server request
+    RESPONSE    = 2   # server → client response
+    STREAM      = 4   # chunk belongs to a CONNECT tunnel
+    CLOSE       = 8   # sender is closing the tunnel (either side)
+    EOF         = 16  # upstream TCP reached EOF (server → client only)
 
     @staticmethod
     def name(ptype: int) -> str:
@@ -46,6 +38,8 @@ class PacketType:
         if ptype & PacketType.REQUEST:   parts.append('REQUEST')
         if ptype & PacketType.RESPONSE:  parts.append('RESPONSE')
         if ptype & PacketType.STREAM:    parts.append('STREAM')
+        if ptype & PacketType.CLOSE:     parts.append('CLOSE')
+        if ptype & PacketType.EOF:       parts.append('EOF')
         return '|'.join(parts) if parts else f'UNKNOWN({ptype})'
 
 
@@ -53,6 +47,7 @@ class Packet:
     pid         : int
     ptype       : int
     timestamp   : int
+    seq         : int   # per-stream sequence number for ordering
 
     context     : typing.Dict[str, typing.Any]
 
@@ -60,6 +55,7 @@ class Packet:
         self.pid        = None
         self.ptype      = ptype
         self.timestamp  = None
+        self.seq        = 0
         self.context    = {}
 
     def set(self,
@@ -84,12 +80,14 @@ class Packet:
             'pid':       self.pid,
             'ptype':     self.ptype,
             'timestamp': self.timestamp,
+            'seq':       self.seq,
             'b':         b,
         }
         logger.debug(
-            f"Packet.serialize: pid={self.pid} ptype={PacketType.name(self.ptype)} "
-            f"destination={self.get('d') or self.get('destination')} "
-            f"body_len={len(b) if b else 0}"
+            f"Packet.serialize: pid={self.pid} seq={self.seq} "
+            f"ptype={PacketType.name(self.ptype)} "
+            f"dst={self.get('d') or self.get('destination')} "
+            f"body={len(b) if b else 0}B"
         )
         return d
 
@@ -99,13 +97,15 @@ class Packet:
         packet           = cls(ptype=raw.get('ptype', PacketType.REQUEST))
         packet.pid       = raw.get('pid')
         packet.timestamp = raw.get('timestamp')
+        packet.seq       = raw.get('seq', 0)
         for k, v in raw.items():
-            if k not in ('pid', 'ptype', 'timestamp'):
+            if k not in ('pid', 'ptype', 'timestamp', 'seq'):
                 packet.set(k, v)
         logger.debug(
-            f"Packet.deserialize: pid={packet.pid} ptype={PacketType.name(packet.ptype)} "
-            f"destination={packet.get('d') or packet.get('destination')} "
-            f"body_len={len(packet.get('b')) if packet.get('b') else 0}"
+            f"Packet.deserialize: pid={packet.pid} seq={packet.seq} "
+            f"ptype={PacketType.name(packet.ptype)} "
+            f"dst={packet.get('d') or packet.get('destination')} "
+            f"body={len(packet.get('b')) if packet.get('b') else 0}B"
         )
         return packet
 
@@ -113,20 +113,21 @@ class Packet:
         b    = self.get('b')
         blen = len(b) if b else 0
         return (
-            f"Packet(pid={self.pid} ptype={PacketType.name(self.ptype)} "
+            f"Packet(pid={self.pid} seq={self.seq} "
+            f"ptype={PacketType.name(self.ptype)} "
             f"ts={self.timestamp} body={blen}B "
             f"dst={self.get('d') or self.get('destination')})"
         )
 
 
 class PacketQueue:
-    LIMIT_TIMEOUT   = 1    # seconds — flush window
-    LIMIT_SIZE      = 512  # bytes   — unused for now, reserved
+    LIMIT_TIMEOUT   = 0.5  # seconds — flush window
+    LIMIT_SIZE      = 512  # bytes   — reserved
 
     def __init__(self):
         self._lock      = asyncio.Lock()
         self._loop      = asyncio.get_running_loop()
-        self._queue     : list[Packet]                  = []
+        self._queue     : list[Packet]                          = []
         self._finished  : typing.Optional[asyncio.Event]       = None
         self._timer     : typing.Optional[asyncio.TimerHandle] = None
 
@@ -134,14 +135,13 @@ class PacketQueue:
         ):
         async with self._lock:
             if self._finished is None:
-                # Queue was never used — nothing to wait for
                 raise RuntimeError("PacketQueue.wait() called before any enqueue()")
         await self._finished.wait()
 
     async def enqueue(self,
             packet: Packet
         ):
-        logger.debug(f"PacketQueue.enqueue: {packet!r} queue_depth={len(self._queue)}")
+        logger.debug(f"PacketQueue.enqueue: {packet!r} depth={len(self._queue)}")
         async with self._lock:
             if self._finished is None:
                 self._finished = asyncio.Event()
@@ -151,10 +151,9 @@ class PacketQueue:
                 )
             elif self._finished.is_set():
                 logger.warning(
-                    f"PacketQueue.enqueue: queue already flushed — dropping {packet!r}"
+                    f"PacketQueue.enqueue: already flushed — dropping {packet!r}"
                 )
                 return
-
             self._queue.append(packet)
 
     async def _on_timeout(self
@@ -162,17 +161,17 @@ class PacketQueue:
         async with self._lock:
             if self._finished is None:
                 raise RuntimeError("PacketQueue._on_timeout() with no _finished event")
-            logger.debug(
-                f"PacketQueue._on_timeout: flushing {len(self._queue)} packet(s)"
-            )
+            logger.debug(f"PacketQueue._on_timeout: flushing {len(self._queue)} packet(s)")
             self._finished.set()
 
 
+# ── PacketPool ────────────────────────────────────────────────────────────────
+# Plain REQUEST/RESPONSE: one waiter per pid, consumed once.
 class PacketPool:
     def __init__(self):
         self._lock    = asyncio.Lock()
         self._pool    : list[Packet]             = []
-        self._waiters : dict[int, asyncio.Event] = {}  # pid → event
+        self._waiters : dict[int, asyncio.Event] = {}
 
     async def put(self,
             packet: Packet
@@ -183,14 +182,14 @@ class PacketPool:
             self._pool.append(packet)
             event = self._waiters.get(packet.pid)
         if event:
-            logger.debug(f"PacketPool.put: waking waiter for pid={packet.pid}")
+            logger.debug(f"PacketPool.put: waking waiter pid={packet.pid}")
             event.set()
 
     async def put_many(self,
             packets: list[Packet]
         ):
         logger.debug(
-            f"PacketPool.put_many: depositing {len(packets)} packet(s) "
+            f"PacketPool.put_many: {len(packets)} packet(s) "
             f"pids={[p.pid for p in packets]}"
         )
         events = []
@@ -201,10 +200,9 @@ class PacketPool:
                 if event:
                     events.append((packet.pid, event))
         for pid, event in events:
-            logger.debug(f"PacketPool.put_many: waking waiter for pid={pid}")
+            logger.debug(f"PacketPool.put_many: waking waiter pid={pid}")
             event.set()
 
-    # Zero-polling wait — suspends until the exact pid arrives or timeout
     async def wait_for(self,
             pid     : int,
             timeout : float = 30.0
@@ -213,7 +211,6 @@ class PacketPool:
         event = asyncio.Event()
 
         async with self._lock:
-            # Already arrived before we registered
             for packet in self._pool:
                 if packet.pid == pid:
                     self._pool.remove(packet)
@@ -250,6 +247,118 @@ class PacketPool:
                     logger.debug(f"PacketPool.find: matched {packet!r}")
                     return packet
         return None
+
+
+# ── StreamBuffer ──────────────────────────────────────────────────────────────
+# One per CONNECT tunnel (keyed by pid in StreamRegistry).
+# Holds response chunks pushed by the relay and delivers them in seq order.
+# _handle_stream calls get() which suspends until the next in-order chunk
+# is available.  The server's continuous reader stamps each chunk with a
+# monotonically increasing seq so out-of-order delivery (e.g. GAS batching)
+# is reordered here before the client sees it.
+class StreamBuffer:
+    def __init__(self, pid: int):
+        self.pid        = pid
+        self._lock      = asyncio.Lock()
+        self._heap      : list[Packet]  = []
+        self._next_seq  : int           = 0
+        self._event     : asyncio.Event = asyncio.Event()
+        self._closed    : bool          = False
+
+    async def put(self,
+            packet: Packet
+        ):
+        logger.debug(
+            f"StreamBuffer.put: pid={self.pid} seq={packet.seq} "
+            f"ptype={PacketType.name(packet.ptype)} "
+            f"body={len(packet.get('b') or b'') if packet.get('b') else 0}B"
+        )
+        async with self._lock:
+            if self._closed:
+                logger.warning(
+                    f"StreamBuffer.put: pid={self.pid} closed — dropping seq={packet.seq}"
+                )
+                return
+            self._heap.append(packet)
+            self._heap.sort(key=lambda p: p.seq)
+        self._event.set()
+
+    # Returns the next in-order packet, waiting if it hasn't arrived yet.
+    # Returns None on timeout.  Caller checks ptype for CLOSE/EOF.
+    async def get(self,
+            timeout: float = 30.0
+        ) -> typing.Optional[Packet]:
+        deadline = time.monotonic() + timeout
+        while True:
+            async with self._lock:
+                if self._heap and self._heap[0].seq == self._next_seq:
+                    packet          = self._heap.pop(0)
+                    self._next_seq += 1
+                    logger.debug(
+                        f"StreamBuffer.get: pid={self.pid} delivering seq={packet.seq} "
+                        f"ptype={PacketType.name(packet.ptype)}"
+                    )
+                    return packet
+                if self._closed:
+                    logger.debug(f"StreamBuffer.get: pid={self.pid} closed — None")
+                    return None
+                self._event.clear()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"StreamBuffer.get: pid={self.pid} "
+                    f"timeout waiting for seq={self._next_seq}"
+                )
+                return None
+            try:
+                await asyncio.wait_for(self._event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"StreamBuffer.get: pid={self.pid} "
+                    f"timeout waiting for seq={self._next_seq}"
+                )
+                return None
+
+    async def close(self
+        ):
+        async with self._lock:
+            self._closed = True
+        self._event.set()
+        logger.debug(f"StreamBuffer.close: pid={self.pid}")
+
+
+# ── StreamRegistry ────────────────────────────────────────────────────────────
+# Shared between the relay (puts chunks) and _handle_stream (gets chunks).
+# Held on Handler so both sides see the same instance.
+class StreamRegistry:
+    def __init__(self):
+        self._lock    = asyncio.Lock()
+        self._buffers : dict[int, StreamBuffer] = {}
+
+    async def get_or_create(self,
+            pid: int
+        ) -> StreamBuffer:
+        async with self._lock:
+            if pid not in self._buffers:
+                self._buffers[pid] = StreamBuffer(pid)
+                logger.debug(f"StreamRegistry: created buffer pid={pid}")
+            return self._buffers[pid]
+
+    async def get(self,
+            pid: int
+        ) -> typing.Optional[StreamBuffer]:
+        async with self._lock:
+            return self._buffers.get(pid)
+
+    async def remove(self,
+            pid: int
+        ):
+        async with self._lock:
+            buf = self._buffers.pop(pid, None)
+        if buf:
+            await buf.close()
+            logger.debug(f"StreamRegistry: removed and closed buffer pid={pid}")
 
 
 class RelayRequest:

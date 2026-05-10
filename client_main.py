@@ -12,18 +12,19 @@ logging.basicConfig(
   ]
 )
 
-from core.client      import ProxyServer, ProxyRequestHandler
-from client_relay_gas import GASRelay
+from core.client       import ProxyServer, ProxyRequestHandler
+from client_relay_gas  import GASRelay
+from client_relay_test import TestRelay
 
 
 async def main():
-    server = ProxyServer(GASRelay, ('0.0.0.0', 8888), ProxyRequestHandler)
+    server = ProxyServer(GASRelay, ('0.0.0.0', 8889), ProxyRequestHandler)
     await server.handler.init()
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    print(f"Proxy running on 0.0.0.0:8888")
+    print(f"Proxy running on 0.0.0.0:8889")
     try:
         while True:
             await asyncio.sleep(1)
