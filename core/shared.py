@@ -97,7 +97,7 @@ class Packet:
 # PacketQueue (unchanged, only for non‑stream)
 class PacketQueue:
     _log = class_logger(__name__, 'PacketQueue')
-    LIMIT_TIMEOUT = 0.05
+    LIMIT_TIMEOUT = 0.5
 
     def __init__(self):
         self._lock = asyncio.Lock()
