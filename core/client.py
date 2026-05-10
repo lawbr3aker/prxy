@@ -7,41 +7,38 @@ import logging
 
 from .shared import (
     class_logger, IDGenerator, PacketType, Packet,
-    PacketPool, StreamRegistry, RelayRequest, RelayBase, HandlerBase
+    StreamRegistry, RelayBase, HandlerBase,
 )
+
 
 class Handler(HandlerBase):
     _log = class_logger(__name__, 'Handler')
 
     def __init__(self, relay_cls: typing.Type[RelayBase]):
         super().__init__(relay_cls, source='client')
-        self._streams = StreamRegistry()
-        self._closed_pids = set()           # track closed tunnels
+        self._streams     = StreamRegistry()
+        self._closed_pids : set[int] = set()
 
     async def _inbound(self, packets: list[Packet]):
         plain = []
-        for packet in packets:
-            if packet.ptype & PacketType.STREAM:
-                # Ignore stale packets for already closed streams
-                if packet.pid in self._closed_pids:
-                    self._log.debug(f"dropping stale packet for closed pid={packet.pid}")
+        for p in packets:
+            if p.ptype & PacketType.STREAM:
+                if p.pid in self._closed_pids:
+                    self._log.debug(f"dropping stale stream pid={p.pid}")
                     continue
-                buf = await self._streams.get_or_create(packet.pid)
-                await buf.put(packet)
+                buf = await self._streams.get_or_create(p.pid)
+                await buf.put(p)
             else:
-                plain.append(packet)
+                plain.append(p)
         if plain:
             await self._pool.put_many(plain)
 
     async def streams(self) -> StreamRegistry:
-        """Return the stream registry (used by ProxyRequestHandler)."""
         return self._streams
 
     async def close_stream(self, pid: int):
-        """Mark a tunnel as closed and remove its buffer."""
         self._closed_pids.add(pid)
         await self._streams.remove(pid)
-        self._log.debug(f"closed stream pid={pid}")
 
 
 class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -55,30 +52,29 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200, 'Connection established')
             self.end_headers()
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-            self._log.warning(f"CONNECT ack failed {self.path} — {exc}")
+            self._log.warning(f"CONNECT ack failed — {exc}")
             return
 
-        pid = None
-        buf = None
+        pid : typing.Optional[int]          = None
+        buf : typing.Optional[object]       = None
         reg = await self.server.handler.streams()
-        seq_out = 0
 
         while True:
+            # ── Read from browser ──────────────────────────────────────────────
             data = None
             try:
                 data = self.connection.recv(65536)
-                if data:
-                    self._log.debug(f"recv pid={pid} bytes={len(data)}")
             except (socket.timeout, TimeoutError):
                 pass
             except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-                self._log.info(f"client reset pid={pid} — {exc}")
+                self._log.debug(f"client socket error pid={pid} — {exc}")
                 if pid is not None:
+                    await self._send_close(pid)
                     await self.server.handler.close_stream(pid)
                 return
 
             if data is not None:
-                if not data:  # EOF
+                if not data:
                     self._log.info(f"client EOF pid={pid}")
                     if pid is not None:
                         await self._send_close(pid)
@@ -87,8 +83,6 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
                 packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
                 packet.pid = pid
-                packet.seq = seq_out
-                seq_out += 1
                 packet.set('destination', self.path)
                 packet.set('body', data)
 
@@ -97,48 +91,42 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 if pid is None:
                     pid = packet.pid
                     buf = await reg.get_or_create(pid)
-                    self._log.info(f"tunnel established pid={pid}")
+                    self._log.info(f"tunnel pid={pid} path={self.path}")
 
             if buf is None:
                 continue
 
+            # ── Drain all available response chunks (timestamp-ordered) ────────
             chunk = await buf.get(timeout=0.05)
-            if chunk is None:
-                continue
-
             while chunk is not None:
-                ptype = chunk.ptype
-                if ptype & PacketType.CLOSE:
+                if chunk.ptype & PacketType.CLOSE:
                     self._log.info(f"server CLOSE pid={pid}")
                     await self.server.handler.close_stream(pid)
                     return
-                if ptype & PacketType.EOF:
-                    self._log.info(f"server EOF pid={pid} — tunnel open, but no more data")
-                    # Do not close the tunnel yet; client may still send data
+
+                if chunk.ptype & PacketType.EOF:
+                    self._log.debug(f"server EOF pid={pid}")
                     break
 
                 body = chunk.get('body') or b''
                 if isinstance(body, str):
                     body = body.encode('latin-1')
                 if body:
-                    self._log.debug(f"← server pid={pid} seq={chunk.seq} bytes={len(body)}")
                     try:
                         self.connection.sendall(body)
                     except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-                        self._log.info(f"write error pid={pid} — {exc}")
+                        self._log.debug(f"write error pid={pid} — {exc}")
                         await self._send_close(pid)
                         await self.server.handler.close_stream(pid)
                         return
-                chunk = await buf.get(timeout=0.0)
+
+                chunk = await buf.get(timeout=0)
 
     async def _send_close(self, pid: int):
-        self._log.info(f"sending CLOSE pid={pid}")
         packet = Packet(ptype=PacketType.REQUEST | PacketType.STREAM | PacketType.CLOSE)
         packet.pid = pid
         packet.set('body', b'')
         await self.server.handler.handle(packet)
-        # Optionally close the stream immediately after sending CLOSE
-        await self.server.handler.close_stream(pid)
 
     async def _handle_request(self):
         self._log.info(f"{self.command} {self.path}")
@@ -146,18 +134,18 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0))
         packet = Packet(ptype=PacketType.REQUEST)
         packet.set('destination', self.path)
-        packet.set('method', self.command)
-        packet.set('headers', dict(self.headers))
+        packet.set('method',      self.command)
+        packet.set('headers',     dict(self.headers))
         if content_length > 0:
             packet.set('body', self.rfile.read(content_length))
 
         await self.server.handler.handle(packet)
 
-        pool = await self.server.handler.pool()
+        pool     = await self.server.handler.pool()
         response = await pool.wait_for(packet.pid, timeout=30.0)
 
         if response is None:
-            self._log.warning(f"timeout pid={packet.pid} {self.command} {self.path}")
+            self._log.warning(f"timeout pid={packet.pid}")
             try:
                 self.send_response(504)
                 self.send_header('Content-Length', '0')
@@ -166,13 +154,13 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                 pass
             return
 
-        status = response.get('status') or 200
+        status  = response.get('status')  or 200
         headers = response.get('headers') or {}
-        body = response.get('body') or b''
+        body    = response.get('body')    or b''
         if isinstance(body, str):
             body = body.encode('latin-1')
 
-        self._log.info(f"pid={packet.pid} {self.command} {self.path} → {status} body={len(body)}B")
+        self._log.info(f"pid={packet.pid} → {status} body={len(body)}B")
         try:
             self.send_response(status)
             skip = {'transfer-encoding', 'content-length', 'connection'}
@@ -183,7 +171,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-            self._log.info(f"write error pid={packet.pid} — {exc}")
+            self._log.debug(f"write error pid={packet.pid} — {exc}")
 
     @staticmethod
     def _run_coro(coro):
@@ -192,16 +180,16 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 future.result()
             except Exception as exc:
-                ProxyRequestHandler._log.error(f"unhandled exception: {exc}", exc_info=True)
+                ProxyRequestHandler._log.error(f"unhandled: {exc}", exc_info=True)
         return wrapper
 
-    do_GET = _run_coro(_handle_request)
-    do_POST = _run_coro(_handle_request)
+    do_GET     = _run_coro(_handle_request)
+    do_POST    = _run_coro(_handle_request)
     do_OPTIONS = _run_coro(_handle_request)
-    do_HEAD = _run_coro(_handle_request)
-    do_PUT = _run_coro(_handle_request)
-    do_DELETE = _run_coro(_handle_request)
-    do_PATCH = _run_coro(_handle_request)
+    do_HEAD    = _run_coro(_handle_request)
+    do_PUT     = _run_coro(_handle_request)
+    do_DELETE  = _run_coro(_handle_request)
+    do_PATCH   = _run_coro(_handle_request)
     do_CONNECT = _run_coro(_handle_stream)
 
     def log_message(self, fmt, *args):
@@ -209,13 +197,13 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ProxyServer(http.server.ThreadingHTTPServer):
-    _log = class_logger(__name__, 'ProxyServer')
+    _log           = class_logger(__name__, 'ProxyServer')
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, relay_cls: typing.Type[RelayBase], addr: tuple,
-                 handler_cls: typing.Type[ProxyRequestHandler]):
+    def __init__(self, relay_cls: typing.Type[RelayBase],
+                 addr: tuple, handler_cls: typing.Type[ProxyRequestHandler]):
         super().__init__(addr, handler_cls)
         self.handler = Handler(relay_cls)
-        self.loop = asyncio.get_running_loop()
+        self.loop    = asyncio.get_running_loop()
         self._log.info(f"listening on {addr[0]}:{addr[1]}")
