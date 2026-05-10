@@ -14,7 +14,6 @@ logging.basicConfig(
 
 from core.client       import ProxyServer, ProxyRequestHandler
 from client_relay_gas  import GASRelay
-from client_relay_test import TestRelay
 
 
 async def main():
