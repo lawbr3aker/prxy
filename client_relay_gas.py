@@ -71,9 +71,11 @@ class GASRelay(RelayBase):
                 ) as r:
                     errors = 0
                     if r.status == 204:
+                        await asyncio.sleep(0.2)
                         continue
                     text = await r.text()
                     if not text.strip():
+                        await asyncio.sleep(0.2)
                         continue
                     data = json.loads(text)
                     if isinstance(data, dict):

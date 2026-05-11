@@ -5,6 +5,8 @@ var CACHE_TTL     = 300;    // seconds
 var POLL_INTERVAL = 200;    // ms between cache checks in fallback doGet
 var POLL_MAX      = 25000;  // ms — stay under GAS 30s limit
 
+var MAX_PAYLOAD   = 45000;  // bytes — under CacheService 100KB limit per key
+
 var cache = CacheService.getScriptCache();
 
 function _log(level, msg) {
@@ -101,15 +103,42 @@ function _forwardToServer(packets) {
 }
 
 
-// ── Cache helpers ─────────────────────────────────────────────────────────────
+// ── Cache helpers (with fragmentation) ───────────────────────────────────────
 function _enqueue(packet, queueName) {
   if (packet.pid === null || packet.pid === undefined) return;
-  var pktKey = 'pkt:' + packet.pid + ':' + (packet.timestamp || 0);
-  var qKey   = 'queue:' + queueName;
-  cache.put(pktKey, JSON.stringify(packet), CACHE_TTL);
-  var pids = JSON.parse(cache.get(qKey) || '[]');
-  pids.push(pktKey);
-  cache.put(qKey, JSON.stringify(pids), CACHE_TTL);
+  var payload = JSON.stringify(packet);
+  var ts      = packet.timestamp || 0;
+
+  // Small packet — store directly
+  if (payload.length <= MAX_PAYLOAD) {
+    var pktKey = 'pkt:' + packet.pid + ':' + ts;
+    cache.put(pktKey, payload, CACHE_TTL);
+    _pushKey(queueName, pktKey);
+    return;
+  }
+
+  // Large packet — split into fragments
+  var fragKeys = [];
+  var index    = 0;
+  while (payload.length > 0) {
+    var chunk = payload.substring(0, MAX_PAYLOAD);
+    payload   = payload.substring(MAX_PAYLOAD);
+    var fKey  = 'pkt:' + packet.pid + ':' + ts + ':' + index;
+    cache.put(fKey, chunk, CACHE_TTL);
+    fragKeys.push(fKey);
+    index++;
+  }
+
+  var rootKey = 'root:' + packet.pid + ':' + ts;
+  cache.put(rootKey, JSON.stringify({ fragments: fragKeys, total: index }), CACHE_TTL);
+  _pushKey(queueName, rootKey);
+}
+
+function _pushKey(queueName, key) {
+  var qKey = 'queue:' + queueName;
+  var keys = JSON.parse(cache.get(qKey) || '[]');
+  keys.push(key);
+  cache.put(qKey, JSON.stringify(keys), CACHE_TTL);
 }
 
 function _drain(queueName) {
@@ -118,14 +147,53 @@ function _drain(queueName) {
   if (!raw) return [];
   var keys = JSON.parse(raw);
   if (!keys.length) return [];
-  var batch = keys.splice(0, 50);
+  var batchKeys = keys.splice(0, 50);
   if (keys.length) cache.put(qKey, JSON.stringify(keys), CACHE_TTL);
   else             cache.remove(qKey);
-  var vals   = cache.getAll(batch);
+
   var result = [];
-  for (var i = 0; i < batch.length; i++) {
-    var v = vals[batch[i]];
-    if (v) { result.push(JSON.parse(v)); cache.remove(batch[i]); }
+  for (var i = 0; i < batchKeys.length; i++) {
+    var key = batchKeys[i];
+
+    // Regular single‑key packet
+    if (key.indexOf('root:') !== 0) {
+      var val = cache.get(key);
+      if (val) {
+        result.push(JSON.parse(val));
+        cache.remove(key);
+      }
+      continue;
+    }
+
+    // Fragmented packet — reassemble
+    var metaVal = cache.get(key);
+    if (!metaVal) continue;
+    cache.remove(key);
+
+    var meta = JSON.parse(metaVal);
+    if (!meta.fragments || !meta.fragments.length) continue;
+
+    var assembled = '';
+    for (var j = 0; j < meta.fragments.length; j++) {
+      var fKey = meta.fragments[j];
+      var frag = cache.get(fKey);
+      if (frag !== null && frag !== undefined) {
+        assembled += frag;
+        cache.remove(fKey);
+      } else {
+        // Missing fragment — drop the whole packet
+        _log('WARN', 'missing fragment ' + fKey + ' for ' + key);
+        assembled = null;
+        break;
+      }
+    }
+    if (assembled !== null && assembled.length > 0) {
+      try {
+        result.push(JSON.parse(assembled));
+      } catch (e) {
+        _log('ERROR', 'failed to parse reassembled packet: ' + e);
+      }
+    }
   }
   return result;
 }

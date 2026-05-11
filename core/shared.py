@@ -86,7 +86,7 @@ class Packet:
 # Batches plain (non-STREAM) outbound packets within LIMIT_TIMEOUT to reduce
 # GAS round-trips. STREAM packets bypass this entirely in HandlerBase.handle().
 class PacketQueue:
-    LIMIT_TIMEOUT = 0.02   # 20 ms
+    LIMIT_TIMEOUT = 0.005   # 5 ms — reduced from 20 ms for lower latency
 
     def __init__(self):
         self._lock     = asyncio.Lock()

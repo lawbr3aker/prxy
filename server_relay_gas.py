@@ -96,9 +96,11 @@ class GASRelay(RelayBase):
                 ) as r:
                     consecutive_errors = 0
                     if r.status == 204:
+                        await asyncio.sleep(0.2)
                         continue
                     text = await r.text()
                     if not text.strip():
+                        await asyncio.sleep(0.2)
                         continue
                     data = json.loads(text)
                     if isinstance(data, dict):
@@ -117,3 +119,6 @@ class GASRelay(RelayBase):
                 consecutive_errors += 1
                 await asyncio.sleep(min(2 ** consecutive_errors, 30))
                 self._log.error(f"puller error: {exc}", exc_info=True)
+
+    # ── Dispatcher methods (inlined from core/server.py for stream ACK) ──────
+    # (See modifications inside Dispatcher._do_stream below)

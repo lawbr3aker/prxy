@@ -2,6 +2,7 @@ import typing
 import asyncio
 import threading
 import socket
+import time
 import http.server
 import logging
 
@@ -45,10 +46,12 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             self._log.warning(f"CONNECT ack failed — {exc}")
             return
 
-        pid : typing.Optional[int]          = None
-        buf : typing.Optional[StreamBuffer] = None
-        reg = await self.server.handler.streams()
-        seq = 0
+        pid             : typing.Optional[int]          = None
+        buf             : typing.Optional[StreamBuffer] = None
+        reg             = await self.server.handler.streams()
+        seq             = 0
+        IDLE_TIMEOUT    = 30.0   # seconds
+        last_data       = time.monotonic()
 
         while True:
             # Read from the browser
@@ -69,6 +72,7 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
                     if pid is not None:
                         await self._send_close(pid, reg)
                     return
+                last_data = time.monotonic()
 
                 p       = Packet(ptype=PacketType.REQUEST | PacketType.STREAM)
                 p.pid   = pid
@@ -92,9 +96,16 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
             if chunk is None:
                 chunk = await buf.get(timeout=0.05)
             if chunk is None:
+                # Check idle timeout
+                if time.monotonic() - last_data > IDLE_TIMEOUT:
+                    self._log.info(f"tunnel idle timeout pid={pid}")
+                    if pid is not None:
+                        await self._send_close(pid, reg)
+                    return
                 continue
 
             while chunk is not None:
+                last_data = time.monotonic()
                 if chunk.ptype & PacketType.CLOSE:
                     self._log.info(f"server CLOSE pid={pid}")
                     await reg.remove(pid)

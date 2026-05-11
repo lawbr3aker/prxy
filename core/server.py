@@ -148,6 +148,13 @@ class Dispatcher:
                 self._streams[pid] = state
             self._log.info(f"TCP ready pid={pid}")
 
+            # ── Tunnel‑opened ACK ────────────────────────────────────────────
+            ack     = Packet(ptype=PacketType.RESPONSE | PacketType.STREAM)
+            ack.pid = pid
+            ack.seq = state.next_seq()
+            ack.set('body', b'')
+            await self._handler.handle(ack)
+
         if body:
             try:
                 state.writer.write(body)
