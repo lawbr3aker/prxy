@@ -10,7 +10,7 @@ from core.shared import _logger, RelayBase, RelayRequest
 
 class GASRelay(RelayBase):
     _log    = _logger(__name__ + '.GASRelay')
-    GAS_URL = 'https://script.google.com/macros/s/AKfycbwW_z3SuOblecNJz65B1BaKGI4eU7EhMnmpTcA4C488R9slyvhyDGiS1LVyErEkVxw2/exec'
+    GAS_URL = 'https://script.google.com/macros/s/AKfycbxFXtT33zjIXsfBOSEUikOPWYgn67Dd8JtuQgHZUIQsz87CKCV8F_pVpJvAgGTLJvgM/exec'
     ROLE    = 'client'
 
     def __init__(self, handler):
