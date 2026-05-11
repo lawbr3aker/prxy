@@ -5,12 +5,12 @@ import aiohttp
 from aiohttp import web
 import logging
 
-from core.shared import class_logger, RelayBase, RelayRequest
+from core.shared import _logger, RelayBase, RelayRequest
 from core.server import Dispatcher
 
 
 class GASRelay(RelayBase):
-    _log        = class_logger(__name__, 'GASRelay')
+    _log        = _logger(__name__ + '.GASRelay')
     GAS_URL     = 'https://script.google.com/macros/s/AKfycbwW_z3SuOblecNJz65B1BaKGI4eU7EhMnmpTcA4C488R9slyvhyDGiS1LVyErEkVxw2/exec'
     ROLE        = 'server'
     LISTEN_PORT = 8888
