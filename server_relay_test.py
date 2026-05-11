@@ -2,13 +2,13 @@ import typing
 import asyncio
 import logging
 
-from core.shared import class_logger, RelayBase, RelayRequest
+from core.shared import _logger, RelayBase, RelayRequest
 from core.server import Dispatcher
 from client_relay_test import LocalBridge
 
 
 class ServerTestRelay(RelayBase):
-    _log = class_logger(__name__, 'ServerTestRelay')
+    _log = _logger(__name__ + '.ServerTestRelay')
 
     def __init__(self, handler):
         self._handler    = handler

@@ -2,10 +2,10 @@ import typing
 import asyncio
 import logging
 
-from core.shared import class_logger, RelayBase, RelayRequest
+from core.shared import _logger, RelayBase, RelayRequest
 
 
-_log = class_logger(__name__, 'LocalBridge')
+_log = _logger(__name__ + '.LocalBridge')
 
 
 class LocalBridge:
@@ -32,7 +32,7 @@ class LocalBridge:
 
 
 class ClientTestRelay(RelayBase):
-    _log = class_logger(__name__, 'ClientTestRelay')
+    _log = _logger(__name__ + '.ClientTestRelay')
 
     def __init__(self, handler):
         self._handler = handler
