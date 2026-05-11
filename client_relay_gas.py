@@ -1,5 +1,6 @@
 import typing
 import asyncio
+import ssl
 import json
 import aiohttp
 import logging
@@ -21,6 +22,9 @@ class GASRelay(RelayBase):
         asyncio.ensure_future(self._run())
 
     async def _run(self):
+        ssl_ctx                = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
         async with aiohttp.ClientSession() as session:
             self._session = session
             self._session_ready.set()
